@@ -116,8 +116,8 @@ function updateCamera(dt) {
   const tx = P.onFoot ? P.x : P.vehicle.x, tz = P.onFoot ? P.z : P.vehicle.z;
   const a = P.onFoot ? P.angle : P.vehicle.angle;
   const front = shot === 'chase';
-  const dist = front ? -13 : (P.onFoot ? 7 : 11);
-  const height = P.onFoot ? 3.2 : 4.5;
+  const dist = front ? -13 : (P.onFoot ? 6.5 : 9);
+  const height = P.onFoot ? 3 : 3.6;
   const side = front ? 7 : 0;
   desired.set(
     tx - Math.cos(a) * dist - Math.sin(a) * side,
@@ -126,7 +126,9 @@ function updateCamera(dt) {
   );
   camPos.lerp(desired, 1 - Math.exp(-4 * dt));
   camera.position.copy(camPos);
-  camTarget.set(tx + Math.cos(a) * 6, 1.6, tz + Math.sin(a) * 6);
+  // Chase cam looks back past the car so its pursuers stay in frame.
+  const look = front ? -4 : 6;
+  camTarget.set(tx + Math.cos(a) * look, 1.6, tz + Math.sin(a) * look);
   camera.lookAt(camTarget);
   G.camYaw = Math.atan2(camTarget.z - camera.position.z, camTarget.x - camera.position.x);
 }
@@ -148,7 +150,7 @@ if (shot) {
     G.autoDrive = 1;
     G.objective = 'Free roam — find a mission marker';
   } else if (shot === 'street') {
-    player.x = 20; player.z = 40; player.angle = -Math.PI / 2;
+    player.x = 0; player.z = 40; player.angle = -Math.PI / 2;
   } else if (shot === 'chase') {
     putPlayerInCar('sedan', -20, -140, 0, 0x2e6fc2);
     G.autoDrive = 1;

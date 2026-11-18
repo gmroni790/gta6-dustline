@@ -19,15 +19,15 @@ export function createHUD() {
     onAction: null,
 
     showMenu(name) {
-      for (const k in menus) if (menus[k]) menus[k].style.display = 'none';
-      if (menus[name]) menus[name].style.display = '';
-      if (el.hud) el.hud.style.display =
-        (name === 'title' || name === 'wasted' || name === 'busted') ? 'none' : '';
+      for (const k in menus) if (menus[k]) menus[k].classList.add('hidden');
+      if (menus[name]) menus[name].classList.remove('hidden');
+      if (el.hud) el.hud.classList.toggle('hidden',
+        name === 'title' || name === 'wasted' || name === 'busted');
     },
 
     hideAllMenus() {
-      for (const k in menus) if (menus[k]) menus[k].style.display = 'none';
-      if (el.hud) el.hud.style.display = '';
+      for (const k in menus) if (menus[k]) menus[k].classList.add('hidden');
+      if (el.hud) el.hud.classList.remove('hidden');
     },
 
     flash(msg, ms = 2500) {
