@@ -58,10 +58,10 @@ export function createHUD() {
       }
       const V = P.vehicle || null;
       if (el.speed) el.speed.textContent = V ? Math.round(V.speed * 2.237) + ' mph' : '';
-      const w = C ? C.weapon : null;
-      const armed = w && w.name && w.name !== 'Fists';
-      const wname = armed ? w.name : 'Fists';
-      const ammoTxt = armed ? (w.mag ?? 0) + '/' + (w.reserve ?? 0) : '';
+      const w = C ? C.weapon : 'fists';
+      const armed = w === 'pistol' || w === 'smg';
+      const wname = armed ? (w === 'pistol' ? 'Pistol' : 'SMG') : 'Fists';
+      const ammoTxt = armed ? (C.mag[w] ?? 0) + '/' + (C.ammo[w] ?? 0) : '';
       if (el.weapon) el.weapon.textContent = armed ? wname + ' ' + ammoTxt : wname;
       if (el.ammo) el.ammo.textContent = ammoTxt;
       if (el.objective) el.objective.textContent = G.objective || '';
@@ -122,7 +122,7 @@ export function createHUD() {
         ctx.fill();
       }
     }
-    const relics = (M && M.relics && (M.relics.list || M.relics.items || M.relics.all)) || (W && W.relics) || [];
+    const relics = (M && M.relics && (M.relics.list || M.relics.items || M.relics.all)) || (W && (W.relics || W.relicSpots)) || [];
     const found = (M && M.relics && M.relics.found) || new Set();
     ctx.fillStyle = '#22d3ee';
     relics.forEach((r, i) => {

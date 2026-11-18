@@ -33,7 +33,7 @@ camera.position.set(90, 55, 90);
 const sun = new THREE.DirectionalLight(0xfff2d0, 2.4);
 sun.position.set(140, 200, 80);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(shot ? 1024 : 2048, shot ? 1024 : 2048);
 sun.shadow.camera.left = -160; sun.shadow.camera.right = 160;
 sun.shadow.camera.top = 160; sun.shadow.camera.bottom = -160;
 sun.shadow.camera.near = 10; sun.shadow.camera.far = 600;
@@ -156,7 +156,7 @@ if (shot) {
     G.objective = 'Lose the heat!';
   } else if (shot === 'mission') {
     player.x = 165; player.z = -138; player.angle = Math.PI;
-    missions.start(0);
+    missions.start(0, G);
   }
 }
 
@@ -222,7 +222,10 @@ let prevState = G.state;
 let frames = 0;
 function tick() {
   requestAnimationFrame(tick);
-  const dt = Math.min(clock.getDelta(), 0.05);
+  const rawDt = clock.getDelta();
+  // In shot mode the renderer is slow (software GL), so the game advances on
+  // a fixed step per frame: the shot staging is about game time, not wall time.
+  const dt = shot ? 1 / 30 : Math.min(rawDt, 0.05);
   G.time += dt;
   updateAim();
   if (G.state === 'playing') {
@@ -255,7 +258,7 @@ function tick() {
     prevState = G.state;
   }
   renderer.render(scene, camera);
-  if (++frames === 120) window.__shotReady = true;
+  if (++frames === 30) window.__shotReady = true;
   G.input.pressed.clear();
   G.input.mouseClicked = false;
   G.input.wheel = 0;
