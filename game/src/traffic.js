@@ -1,320 +1,299 @@
-import * as THREE from 'three';
-import { makeVehicle, driveVehicle, VEHICLE_TYPES } from './vehicles.js';
+// Dustline — traffic.js
+//
+// The living city: self-driving cars on the road grid and pedestrians
+// on the sidewalks. Cars keep right, turn at intersections, slow for
+// the vehicle ahead and brake for the player. Pedestrians stroll the
+// sidewalk line, turn corners and bob as they walk. Everything starts
+// lazily on the first update, because the factory must not touch other
+// modules: ones attached after this one do not exist yet when it runs.
 
-// main.js merges T.cars into G.vehicles at startup; the traffic cars live here.
-const TAU = Math.PI * 2;
-function wrapAngle(a) {
-  while (a > Math.PI) a -= TAU;
-  while (a < -Math.PI) a += TAU;
-  return a;
-}
-function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-function dist2(ax, az, bx, bz) {
-  const dx = ax - bx, dz = az - bz;
-  return dx * dx + dz * dz;
-}
-const CAR_COLORS = [0xcc3333, 0x3366cc, 0xdddddd, 0x222222, 0xcc9933, 0x339966, 0x8844aa, 0x8899aa];
-const SHIRT_COLORS = [0xd94f4f, 0x4f7dd9, 0x4fd98a, 0xd9c24f, 0xd94fc0, 0x8a5a2b, 0xe8e8e8, 0x3a3a3a];
+import * as THREE from '../vendor/three.module.min.js';
+import { clamp, wrapAngle, angleLerp, dist2 } from './utils.js';
 
-function randomRoadPoint(W, R) {
-  const road = W.roads[Math.floor(R() * W.roads.length)];
-  const t = R();
-  return { x: road.x1 + (road.x2 - road.x1) * t, z: road.z1 + (road.z2 - road.z1) * t, road, t };
-}
-function roadAngle(road) { return Math.atan2(road.z2 - road.z1, road.x2 - road.x1); }
-function roadLength(road) { return Math.hypot(road.x2 - road.x1, road.z2 - road.z1); }
-function nearestRoadTo(W, x, z) {
-  let best = null, bestD = Infinity;
-  for (const road of W.roads) {
-    const dx = road.x2 - road.x1, dz = road.z2 - road.z1;
-    const len2 = dx * dx + dz * dz || 1;
-    const t = clamp(((x - road.x1) * dx + (z - road.z1) * dz) / len2, 0, 1);
-    const dd = dist2(x, z, road.x1 + dx * t, road.z1 + dz * t);
-    if (dd < bestD) {
-      bestD = dd;
-      best = { road, t };
-    }
-  }
-  return best;
-}
-function pointOnRoad(road, t, side) {
-  const len = roadLength(road);
-  const ux = (road.x2 - road.x1) / len, uz = (road.z2 - road.z1) / len;
-  return { x: road.x1 + ux * len * t - uz * side, z: road.z1 + uz * len * t + ux * side };
-}
+const TARGET_CARS = 14;
+const TARGET_PEDS = 18;
+const DESPAWN_DIST = 280;
+const SHIRTS = [0xc23b2a, 0x2e6ea6, 0x4a9a4a, 0xe8c33a, 0x8a5aa6, 0xe88a3a, 0x3aa69a, 0xd8d0c0];
+const SKINS = [0xe8b88a, 0xc08a5e, 0x8a5a3a, 0xf0c8a0];
 
-function buildPerson(R) {
-  const g = new THREE.Group();
-  const shirt = new THREE.MeshStandardMaterial({
-    color: SHIRT_COLORS[Math.floor(R() * SHIRT_COLORS.length)], transparent: true,
-  });
-  const pants = new THREE.MeshStandardMaterial({ color: 0x2e3440, transparent: true });
-  const skin = new THREE.MeshStandardMaterial({ color: 0xd9a077, transparent: true });
-  const mats = [shirt, pants, skin];
-  function part(w, h, d, mat, x, y, z) {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-    mesh.position.set(x, y, z);
-    g.add(mesh);
-    return mesh;
-  }
-  function makeLeg(sideX) {
-    // Geometry translated down so the mesh pivots at the hip for the walk swing.
-    const geo = new THREE.BoxGeometry(0.16, 0.8, 0.18);
-    geo.translate(0, -0.4, 0);
-    const leg = new THREE.Mesh(geo, pants);
-    leg.position.set(sideX, 0.8, 0);
-    g.add(leg);
-    return leg;
-  }
-  const legL = makeLeg(-0.11);
-  const legR = makeLeg(0.11);
-  part(0.52, 0.62, 0.3, shirt, 0, 1.11, 0);
-  part(0.3, 0.3, 0.3, skin, 0, 1.6, 0);
-  part(0.13, 0.55, 0.15, shirt, -0.34, 1.1, 0);
-  part(0.13, 0.55, 0.15, shirt, 0.34, 1.1, 0);
-  return { g, legL, legR, mats };
-}
-
-export function createTraffic(scene, world, rng) {
-  const R = typeof rng === 'function' ? rng : Math.random;
+export function createTraffic(ctx) {
+  const { scene, rng } = ctx;
   const cars = [];
   const peds = [];
+  let started = false;
 
-  // 14 traffic cars on random roads, random types, random directions.
-  for (let i = 0; i < 14; i++) {
-    const p = randomRoadPoint(world, R);
-    const type = VEHICLE_TYPES[Math.floor(R() * VEHICLE_TYPES.length)];
-    const dir = R() < 0.5 ? 1 : -1;
-    const V = makeVehicle(type.id, p.x, p.z,
-      roadAngle(p.road) + (dir < 0 ? Math.PI : 0),
-      CAR_COLORS[Math.floor(R() * CAR_COLORS.length)]);
-    V.driver = 'traffic';
-    V.road = p.road;
-    V.dir = dir;
-    scene.add(V.mesh);
-    cars.push(V);
+  // Where the player is, as best we can tell. The player module owns
+  // the truth; the camera follows the player, so it is a fair fallback.
+  function playerPos() {
+    const p = ctx.player;
+    if (p && p.group && p.group.position) return { x: p.group.position.x, z: p.group.position.z };
+    if (p && p.position) return { x: p.position.x, z: p.position.z };
+    if (ctx.camera) return { x: ctx.camera.position.x, z: ctx.camera.position.z };
+    return { x: 0, z: 0 };
   }
 
-  function startNewWalk(pd, snap) {
-    const found = snap ? nearestRoadTo(world, pd.x, pd.z) : null;
-    const rp = found || randomRoadPoint(world, R);
-    pd.road = rp.road;
-    pd.t = rp.t;
-    pd.dir = R() < 0.5 ? 1 : -1;
-    pd.side = (3.5 + R() * 1.5) * (R() < 0.5 ? -1 : 1);
-    pd.timer = 12 + R() * 13;
+  // --- road helpers ------------------------------------------------------------
+  function roadEnd(seg, dir) {
+    return dir > 0 ? { x: seg.bx, z: seg.bz } : { x: seg.ax, z: seg.az };
+  }
+  function roadPoint(seg, t) {
+    return { x: seg.ax + (seg.bx - seg.ax) * t, z: seg.az + (seg.bz - seg.az) * t };
+  }
+  // Heading that points along a segment in the given direction.
+  function roadHeading(seg, dir) {
+    return Math.atan2((seg.bx - seg.ax) * dir, (seg.bz - seg.az) * dir);
+  }
+  // The vector pointing to the right of a heading (driver's right side).
+  function rightOf(h) {
+    return { x: -Math.cos(h), z: Math.sin(h) };
+  }
+  function objPos(o) {
+    return o.vehicle ? o.vehicle.group.position : o.group.position;
   }
 
-  function respawnPed(pd, farFrom) {
-    let spot = null;
-    for (let k = 0; k < 14; k++) {
-      const cand = randomRoadPoint(world, R);
-      if (!farFrom || dist2(cand.x, cand.z, farFrom.x, farFrom.z) > 1600) {
-        spot = cand;
-        break;
+  // At an intersection not just turned at, a car or pedestrian may
+  // switch onto the crossing road, which keeps the grid alive instead
+  // of every car driving to the map edge and back.
+  function tryTurn(o, chance) {
+    const pos = objPos(o);
+    const pts = ctx.world.intersections;
+    for (let i = 0; i < pts.length; i++) {
+      const pt = pts[i];
+      if (dist2(pt.x, pt.z, pos.x, pos.z) > 7) continue;
+      if (o.lastTurn && o.lastTurn.x === pt.x && o.lastTurn.z === pt.z) return;
+      o.lastTurn = { x: pt.x, z: pt.z };
+      if (!rng.chance(chance)) return;
+      const options = [];
+      for (const s of ctx.world.roads) {
+        if (s === o.seg) continue;
+        const vertical = s.ax === s.bx;
+        const through = vertical
+          ? s.ax === pt.x && pt.z >= s.az && pt.z <= s.bz
+          : s.az === pt.z && pt.x >= s.ax && pt.x <= s.bx;
+        if (through) options.push(s);
       }
+      if (options.length === 0) return;
+      o.seg = rng.pick(options);
+      o.dir = rng.chance(0.5) ? 1 : -1;
+      return;
     }
-    spot = spot || randomRoadPoint(world, R);
-    pd.x = spot.x;
-    pd.z = spot.z;
-    pd.hp = 100;
-    pd.state = 'walk';
-    pd.deadT = 0;
-    pd.fleeT = 0;
-    pd.mesh.rotation.x = 0;
-    for (const m of pd.mats) m.opacity = 1;
-    startNewWalk(pd, false);
-    const q = pointOnRoad(pd.road, pd.t, pd.side);
-    pd.x = q.x;
-    pd.z = q.z;
-    pd.angle = roadAngle(pd.road) + (pd.dir < 0 ? Math.PI : 0);
+    if (o.lastTurn && dist2(o.lastTurn.x, o.lastTurn.z, pos.x, pos.z) > 20) o.lastTurn = null;
   }
 
-  // 22 pedestrians walking the road sides.
-  for (let i = 0; i < 22; i++) {
-    const pm = buildPerson(R);
-    const pd = {
-      mesh: pm.g, legL: pm.legL, legR: pm.legR, mats: pm.mats,
-      x: 0, z: 0, angle: 0, speed: 1.2 + R() * 0.6, state: 'walk', deadT: 0,
-      hp: 100, road: null, t: 0, dir: 1, side: 4, timer: 12 + R() * 13,
-      phase: R() * 6, fleeT: 0, fx: 1, fz: 0,
-    };
-    respawnPed(pd, null);
-    scene.add(pd.mesh);
-    peds.push(pd);
+  // True when (x, z) sits ahead of a vehicle within range and lane width.
+  function aheadOf(pos, fx, fz, x, z, range, halfWidth) {
+    const ox = x - pos.x;
+    const oz = z - pos.z;
+    const along = ox * fx + oz * fz;
+    if (along <= 0 || along >= range) return false;
+    return Math.abs(ox * fz - oz * fx) < halfWidth;
   }
 
-  function update(dt, G) {
-    const P = G.player;
-    const PO = G.police;
-
-    for (const V of cars) {
-      if (V.driver !== 'traffic' || !V.alive) continue;
-
-      // Teleport far-away cars back to a road 90-140 from the player.
-      if (dist2(V.x, V.z, P.x, P.z) > 260 * 260) {
-        let spot = null;
-        for (let k = 0; k < 14; k++) {
-          const cand = randomRoadPoint(world, R);
-          const dd = Math.sqrt(dist2(cand.x, cand.z, P.x, P.z));
-          if (dd > 90 && dd < 140) {
-            spot = cand;
-            break;
-          }
-        }
-        if (spot) {
-          V.road = spot.road;
-          V.dir = R() < 0.5 ? 1 : -1;
-          V.x = spot.x;
-          V.z = spot.z;
-          V.angle = roadAngle(spot.road) + (V.dir < 0 ? Math.PI : 0);
-          V.speed = 0;
-          V.mesh.position.set(V.x, 0, V.z);
-          V.mesh.rotation.y = -V.angle;
-        }
-        continue;
-      }
-
-      // Follow the current road; at an end, switch roads (70%) or turn back.
-      let road = V.road;
-      let dx = road.x2 - road.x1, dz = road.z2 - road.z1;
-      let len2 = dx * dx + dz * dz || 1;
-      let t = ((V.x - road.x1) * dx + (V.z - road.z1) * dz) / len2;
-      if ((V.dir > 0 && t > 0.96) || (V.dir < 0 && t < 0.04)) {
-        const cands = world.roads.filter((r) =>
-          r !== road && (dist2(V.x, V.z, r.x1, r.z1) < 225 || dist2(V.x, V.z, r.x2, r.z2) < 225));
-        if (cands.length && R() < 0.7) {
-          road = cands[Math.floor(R() * cands.length)];
-          V.road = road;
-          V.dir = dist2(V.x, V.z, road.x1, road.z1) < dist2(V.x, V.z, road.x2, road.z2) ? 1 : -1;
-          dx = road.x2 - road.x1;
-          dz = road.z2 - road.z1;
-          len2 = dx * dx + dz * dz || 1;
-          t = ((V.x - road.x1) * dx + (V.z - road.z1) * dz) / len2;
-        } else {
-          V.dir = -V.dir;
-        }
-      }
-
-      // Steer toward a point a little way ahead on the road.
-      const aheadT = clamp(t + V.dir * 0.12, 0, 1);
-      const want = Math.atan2(road.z1 + dz * aheadT - V.z, road.x1 + dx * aheadT - V.x);
-      const steer = clamp(wrapAngle(want - V.angle) * 2.2, -1, 1);
-
-      // Slow for anything ahead, brake for the player's car ahead.
-      const probeX = V.x + Math.cos(V.angle) * 6;
-      const probeZ = V.z + Math.sin(V.angle) * 6;
-      let slow = false;
-      for (const o of G.vehicles) {
-        if (o !== V && o.alive && dist2(probeX, probeZ, o.x, o.z) < 12.25) {
-          slow = true;
+  // --- traffic cars --------------------------------------------------------------
+  function spawnCar(near) {
+    const roads = ctx.world.roads;
+    let seg = rng.pick(roads);
+    if (near) {
+      // Prefer a road whose middle is a fair way from the player, so
+      // new cars appear in the distance rather than on top of them.
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const cand = rng.pick(roads);
+        const d = dist2((cand.ax + cand.bx) / 2, (cand.az + cand.bz) / 2, near.x, near.z);
+        if (d > 60 && d < 240) {
+          seg = cand;
           break;
         }
       }
-      if (!slow) {
-        for (const pd of peds) {
-          if (pd.state !== 'dead' && dist2(probeX, probeZ, pd.x, pd.z) < 9) {
-            slow = true;
-            break;
-          }
-        }
-      }
-      const brake = !!(P.vehicle && P.vehicle !== V && dist2(probeX, probeZ, P.vehicle.x, P.vehicle.z) < 16);
-      const wantThrottle = brake ? 0 : slow ? 0.15 : 0.5;
-
-      // Unstuck behaviour: reverse briefly after 2s stuck, then flip direction.
-      if (wantThrottle === 0.5 && Math.abs(V.speed) < 0.6) V.stuckT = (V.stuckT || 0) + dt;
-      else V.stuckT = 0;
-      let throttle = wantThrottle;
-      let steerOut = steer;
-      if (V.stuckT > 2) {
-        throttle = -0.7;
-        steerOut = -steer;
-        if (V.stuckT > 2.9) {
-          V.stuckT = 0;
-          V.dir = -V.dir;
-        }
-      }
-      driveVehicle(V, { throttle, steer: steerOut, brake }, dt, world);
     }
-
-    for (const pd of peds) {
-      if (pd.state === 'dead') {
-        pd.deadT += dt;
-        pd.mesh.rotation.x = -Math.PI / 2 * Math.min(1, pd.deadT / 0.3);
-        if (pd.deadT > 11) respawnPed(pd, P);
-        else if (pd.deadT > 10) {
-          for (const m of pd.mats) m.opacity = 1 - (pd.deadT - 10);
-        }
-        continue;
+    const dir = rng.chance(0.5) ? 1 : -1;
+    const heading = roadHeading(seg, dir);
+    const right = rightOf(heading);
+    // Pick a spot along the road, and re-roll it while it would land
+    // close to the player: the midpoint check above is not enough on a
+    // long road, where one end can sit right next to the player.
+    let pt = roadPoint(seg, rng.range(0.15, 0.85));
+    if (near) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const sx = pt.x + right.x * 3;
+        const sz = pt.z + right.z * 3;
+        if (dist2(sx, sz, near.x, near.z) > 30) break;
+        pt = roadPoint(seg, rng.range(0.15, 0.85));
       }
-
-      let speed = pd.speed;
-      if (pd.state === 'walk') {
-        // Flee from a recent nearby gunshot, or from a high-wanted player.
-        let threatX = 0, threatZ = 0, threat = false;
-        if (G.lastShot && G.time - G.lastShot.time < 3 &&
-            dist2(pd.x, pd.z, G.lastShot.x, G.lastShot.z) < 900) {
-          threatX = G.lastShot.x;
-          threatZ = G.lastShot.z;
-          threat = true;
-        } else if (PO && PO.wanted >= 3 && dist2(pd.x, pd.z, P.x, P.z) < 625) {
-          threatX = P.x;
-          threatZ = P.z;
-          threat = true;
-        }
-        if (threat) {
-          let dx = pd.x - threatX, dz = pd.z - threatZ;
-          const len = Math.hypot(dx, dz) || 1;
-          pd.fx = dx / len;
-          pd.fz = dz / len;
-          pd.fleeT = 4;
-          pd.state = 'flee';
-        }
-      }
-
-      if (pd.state === 'flee') {
-        speed = 4.5;
-        pd.fleeT -= dt;
-        pd.x = clamp(pd.x + pd.fx * speed * dt, -229, 229);
-        pd.z = clamp(pd.z + pd.fz * speed * dt, -229, 229);
-        pd.angle = Math.atan2(pd.fz, pd.fx);
-        if (pd.fleeT <= 0) {
-          pd.state = 'walk';
-          startNewWalk(pd, true);
-        }
-      } else {
-        pd.timer -= dt;
-        const len = roadLength(pd.road) || 1;
-        pd.t += pd.dir * speed * dt / len;
-        if (pd.t <= 0 || pd.t >= 1 || pd.timer <= 0) startNewWalk(pd, true);
-        const q = pointOnRoad(pd.road, clamp(pd.t, 0, 1), pd.side);
-        pd.x = q.x;
-        pd.z = q.z;
-        pd.angle = roadAngle(pd.road) + (pd.dir < 0 ? Math.PI : 0);
-      }
-
-      pd.phase += dt * speed * 3;
-      const swing = Math.sin(pd.phase) * 0.55;
-      pd.legL.rotation.x = swing;
-      pd.legR.rotation.x = -swing;
-      pd.mesh.position.set(pd.x, Math.abs(Math.sin(pd.phase)) * 0.05, pd.z);
-      pd.mesh.rotation.y = -pd.angle;
     }
+    const vehicle = ctx.vehicles.spawn(
+      'random',
+      pt.x + right.x * 3,
+      pt.z + right.z * 3,
+      heading
+    );
+    vehicle.driver = 'traffic';
+    const car = { vehicle, seg, dir, cruise: rng.range(9, 14), lastTurn: null };
+    cars.push(car);
+    return car;
   }
 
-  function nearestCar(x, z, maxD) {
-    let best = null, bestD = maxD * maxD;
-    for (const V of cars) {
-      if (!V.alive) continue;
-      const dd = dist2(x, z, V.x, V.z);
-      if (dd < bestD) {
-        bestD = dd;
-        best = V;
+  function updateCar(car, dt) {
+    const v = car.vehicle;
+    const pos = v.group.position;
+    tryTurn(car, 0.35);
+
+    // Aim at the far end of the road, offset right so opposing traffic passes.
+    let end = roadEnd(car.seg, car.dir);
+    if (dist2(end.x, end.z, pos.x, pos.z) < 10) {
+      car.dir = -car.dir; // reached the road end: turn around and drive back
+      car.lastTurn = null;
+      end = roadEnd(car.seg, car.dir);
+    }
+    const heading = roadHeading(car.seg, car.dir);
+    const right = rightOf(heading);
+    const tx = end.x + right.x * 3;
+    const tz = end.z + right.z * 3;
+    const desired = Math.atan2(tx - pos.x, tz - pos.z);
+    const steer = clamp(wrapAngle(desired - v.heading) * 2.5, -1, 1);
+
+    let throttle = v.speed < car.cruise ? 0.7 : 0.05;
+    let brake = false;
+
+    // Slow down for another vehicle close ahead, in our lane, and brake
+    // for the player on foot (or in a car) just ahead of us.
+    const fx = Math.sin(v.heading);
+    const fz = Math.cos(v.heading);
+    for (const other of ctx.vehicles.all) {
+      if (other === v) continue;
+      const op = other.group.position;
+      if (aheadOf(pos, fx, fz, op.x, op.z, 13, 3.4)) {
+        brake = true;
+        break;
       }
     }
-    return best;
+    if (!brake) {
+      const pp = playerPos();
+      if (aheadOf(pos, fx, fz, pp.x, pp.z, 8, 3)) brake = true;
+    }
+
+    if (brake) throttle = 0;
+    v.drive(throttle, steer, brake, dt);
   }
 
-  return { cars, peds, update, nearestCar };
+  // --- pedestrians ------------------------------------------------------------------
+  function buildPedMesh() {
+    const group = new THREE.Group();
+    const shirt = new THREE.MeshLambertMaterial({ color: rng.pick(SHIRTS) });
+    const skin = new THREE.MeshLambertMaterial({ color: rng.pick(SKINS) });
+    const pants = new THREE.MeshLambertMaterial({ color: 0x3a3a4a });
+
+    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.7, 0.24), pants);
+    legs.position.y = 0.35;
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.65, 0.3), shirt);
+    body.position.y = 1.02;
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.34, 0.32), skin);
+    head.position.y = 1.55;
+
+    // Arms hang from the shoulder: the geometry is shifted so its top
+    // sits at the origin, and swinging rotates around the shoulder.
+    const armGeo = new THREE.BoxGeometry(0.12, 0.55, 0.12);
+    armGeo.translate(0, -0.275, 0);
+    const armL = new THREE.Mesh(armGeo, shirt);
+    armL.position.set(-0.33, 1.28, 0);
+    const armR = new THREE.Mesh(armGeo, shirt);
+    armR.position.set(0.33, 1.28, 0);
+
+    group.add(legs, body, head, armL, armR);
+    return { group, armL, armR };
+  }
+
+  function spawnPed() {
+    const seg = rng.pick(ctx.world.roads);
+    const dir = rng.chance(0.5) ? 1 : -1;
+    const side = rng.chance(0.5) ? 1 : -1;
+    const t = rng.range(0.1, 0.9);
+    const pt = roadPoint(seg, t);
+    const h = roadHeading(seg, dir);
+    const right = rightOf(h);
+    const built = buildPedMesh();
+    built.group.position.set(pt.x + right.x * side * 8.2, 0, pt.z + right.z * side * 8.2);
+    built.group.rotation.y = h;
+    scene.add(built.group);
+    const ped = {
+      group: built.group, armL: built.armL, armR: built.armR,
+      speed: rng.range(1.1, 2.1), heading: h, seg, dir, side,
+      phase: rng.range(0, Math.PI * 2), lastTurn: null,
+    };
+    peds.push(ped);
+    return ped;
+  }
+
+  function updatePed(ped, dt) {
+    const pos = ped.group.position;
+    tryTurn(ped, 0.5);
+
+    // Walk toward the far end, keeping the sidewalk offset on the same
+    // side. Steering toward the target each frame rounds the corners.
+    let end = roadEnd(ped.seg, ped.dir);
+    if (dist2(end.x, end.z, pos.x, pos.z) < 5) {
+      ped.dir = -ped.dir;
+      ped.lastTurn = null;
+      end = roadEnd(ped.seg, ped.dir);
+    }
+    const right = rightOf(ped.heading);
+    const tx = end.x + right.x * ped.side * 8.2;
+    const tz = end.z + right.z * ped.side * 8.2;
+    const desired = Math.atan2(tx - pos.x, tz - pos.z);
+    ped.heading = angleLerp(ped.heading, desired, Math.min(1, 4 * dt));
+
+    pos.x += Math.sin(ped.heading) * ped.speed * dt;
+    pos.z += Math.cos(ped.heading) * ped.speed * dt;
+
+    // Stay inside the playable area: turn back at the edge.
+    const b = ctx.world.bounds;
+    if (pos.x < b.minX + 4 || pos.x > b.maxX - 4 || pos.z < b.minZ + 4 || pos.z > b.maxZ - 4) {
+      pos.x = clamp(pos.x, b.minX + 4, b.maxX - 4);
+      pos.z = clamp(pos.z, b.minZ + 4, b.maxZ - 4);
+      ped.dir = -ped.dir;
+      ped.heading = roadHeading(ped.seg, ped.dir);
+    }
+
+    ped.group.rotation.y = ped.heading;
+    ped.phase += dt * ped.speed * 3.2;
+    ped.group.position.y = Math.abs(Math.sin(ped.phase)) * 0.12;
+    ped.armL.rotation.x = Math.sin(ped.phase) * 0.55;
+    ped.armR.rotation.x = -Math.sin(ped.phase) * 0.55;
+  }
+
+  // --- release and main update ---------------------------------------------------------
+  // Hand a traffic car back: it stops being driven by traffic, which
+  // is what happens when the player climbs into one.
+  function release(vehicle) {
+    const i = cars.findIndex((c) => c.vehicle === vehicle);
+    if (i < 0) return false;
+    cars.splice(i, 1);
+    vehicle.driver = 'none';
+    return true;
+  }
+
+  function update(dt) {
+    if (!ctx.world || !ctx.vehicles) return;
+    if (!started) {
+      started = true;
+      for (let i = 0; i < TARGET_CARS; i++) spawnCar(null);
+      for (let i = 0; i < TARGET_PEDS; i++) spawnPed();
+    }
+
+    // Cars far from the player despawn; fresh ones spawn at a distance
+    // to keep the streets at a steady count.
+    const pp = playerPos();
+    for (let i = cars.length - 1; i >= 0; i--) {
+      const pos = cars[i].vehicle.group.position;
+      if (dist2(pos.x, pos.z, pp.x, pp.z) > DESPAWN_DIST) {
+        cars[i].vehicle.remove();
+        cars.splice(i, 1);
+      }
+    }
+    while (cars.length < TARGET_CARS) spawnCar(pp);
+
+    for (const car of cars) updateCar(car, dt);
+    for (const ped of peds) updatePed(ped, dt);
+  }
+
+  return { cars, peds, update, release };
 }

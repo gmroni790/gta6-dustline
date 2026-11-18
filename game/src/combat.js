@@ -1,246 +1,269 @@
-// Hand-to-hand and gun combat: fists, pistol and SMG, with a muzzle flash,
-// a tracer line and a point light for each shot. Shots and punches that land
-// on people (or ring out near a cop) raise the wanted level.
-import * as THREE from 'three';
-import { damageVehicle } from './vehicles.js';
+// Dustline — combat module.
+// Three weapons (fists, pistol, SMG), hitscan shooting down the camera's
+// view, tracers and a muzzle flash, and a small target registry that other
+// modules (missions) use to make things shootable. Never draws HUD text.
 
-const MELEE_RANGE = 2.2;
-const SHOT_RANGE = 60;
+import * as THREE from '../vendor/three.module.min.js';
+import { dist2 } from './utils.js';
 
-// Cops fall over and stop (alive=false); peds switch to the 'dead' state.
-function damagePerson(target, dmg, isCop) {
-  target.hp = (target.hp == null ? 100 : target.hp) - dmg;
-  if (target.hp <= 0) {
-    if (isCop) target.alive = false;
-    else {
-      target.state = 'dead';
-      target.deadT = 0;
-    }
-  }
-}
+const WEAPONS = {
+  fists: { range: 2.6, damage: 18, delay: 0.35, mag: Infinity, reload: 0 },
+  pistol: { range: 70, damage: 34, delay: 0.28, mag: 12, reload: 1.1 },
+  smg: { range: 45, damage: 16, delay: 0.09, mag: 30, reload: 1.5 },
+};
+const ORDER = ['fists', 'pistol', 'smg'];
+// Which state field holds the reserve ammo for each gun.
+const RESERVE_KEY = { pistol: 'ammoPistol', smg: 'ammoSmg' };
 
-export function createCombat(scene) {
-  const light = new THREE.PointLight(0xffcc66, 0, 9, 2);
-  light.visible = false;
-  scene.add(light);
+export function createCombat(ctx) {
+  const { scene, camera, input, state } = ctx;
 
-  const flash = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.5, 0.5),
-    new THREE.MeshBasicMaterial({ color: 0xffdd88, transparent: true })
-  );
+  // ----- Tracer line and muzzle flash, reused every shot -----
+  const tracerGeo = new THREE.BufferGeometry();
+  tracerGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const tracerMat = new THREE.LineBasicMaterial({ color: 0xffe9a8, transparent: true, opacity: 0 });
+  const tracer = new THREE.Line(tracerGeo, tracerMat);
+  tracer.frustumCulled = false;
+  scene.add(tracer);
+
+  const flashMat = new THREE.MeshBasicMaterial({
+    color: 0xffd23f,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const flash = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.55), flashMat);
   flash.visible = false;
   scene.add(flash);
 
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-  const tracer = new THREE.Line(
-    geo,
-    new THREE.LineBasicMaterial({ color: 0xffe9a8, transparent: true, opacity: 0.9 })
-  );
-  tracer.visible = false;
-  scene.add(tracer);
+  // ----- State -----
+  const targets = []; // { id, group, radius, health, onDestroyed }
+  let nextId = 1;
+  const mags = { pistol: WEAPONS.pistol.mag, smg: WEAPONS.smg.mag };
+  let cooldown = 0;
+  let reloading = null; // weapon word while a reload is running
+  let reloadTimer = 0;
+  let tracerLife = 0;
+  let flashLife = 0;
+
+  const tmpDir = new THREE.Vector3();
+  const tmpTo = new THREE.Vector3();
+  const tmpHit = new THREE.Vector3();
+  const tmpMuzzle = new THREE.Vector3();
+
+  function addTarget(t) {
+    const rec = {
+      id: nextId++,
+      group: t.group,
+      radius: t.radius,
+      health: t.health,
+      onDestroyed: t.onDestroyed,
+    };
+    targets.push(rec);
+    return rec;
+  }
+
+  function removeTarget(handle) {
+    const i = targets.indexOf(handle);
+    if (i >= 0) targets.splice(i, 1);
+  }
+
+  function damageTarget(rec, amount) {
+    rec.health -= amount;
+    if (rec.health <= 0) {
+      removeTarget(rec);
+      if (typeof rec.onDestroyed === 'function') rec.onDestroyed(rec);
+    }
+  }
+
+  // Where the player's feet are, on foot or in a car.
+  function playerPos(out) {
+    const p = ctx.player;
+    if (p) return out.copy(p.group.position);
+    return out.set(0, 0, 0);
+  }
+
+  function muzzlePos(out) {
+    const p = ctx.player;
+    playerPos(out);
+    out.y = 1.45;
+    if (p) {
+      out.x += Math.sin(p.heading) * 0.9;
+      out.z += Math.cos(p.heading) * 0.9;
+    }
+    return out;
+  }
+
+  function showShot(from, to) {
+    const pos = tracerGeo.attributes.position;
+    pos.setXYZ(0, from.x, from.y, from.z);
+    pos.setXYZ(1, to.x, to.y, to.z);
+    pos.needsUpdate = true;
+    tracerLife = 1;
+    tracerMat.opacity = 0.9;
+    flash.position.copy(from);
+    flash.quaternion.copy(camera.quaternion);
+    flash.visible = true;
+    flashLife = 1;
+    flashMat.opacity = 0.95;
+    // A random roll keeps the flash from looking like a stamped square.
+    flash.rotateZ(ctx.rng ? ctx.rng.range(0, Math.PI) : 0);
+  }
+
+  function playShot(weapon) {
+    if (ctx.audio && typeof ctx.audio.shot === 'function') ctx.audio.shot(weapon);
+  }
+
+  // Hitscan along the camera's forward ray; returns the hit point.
+  function fireGun(weapon, cfg) {
+    const origin = muzzlePos(tmpMuzzle);
+    camera.getWorldDirection(tmpDir);
+    let best = null;
+    let bestT = cfg.range;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      // Aim at the middle of the target, about chest height for a figure.
+      tmpTo.set(t.group.position.x, t.group.position.y + 1, t.group.position.z);
+      tmpTo.sub(origin);
+      const along = tmpTo.dot(tmpDir);
+      if (along < 0 || along > bestT) continue;
+      tmpHit.copy(tmpDir).multiplyScalar(along).add(origin);
+      const dx = t.group.position.x - tmpHit.x;
+      const dy = t.group.position.y + 1 - tmpHit.y;
+      const dz = t.group.position.z - tmpHit.z;
+      if (dx * dx + dy * dy + dz * dz <= t.radius * t.radius) {
+        best = t;
+        bestT = along;
+      }
+    }
+    const end = tmpHit.copy(tmpDir).multiplyScalar(bestT).add(origin);
+    showShot(origin, end);
+    if (best) damageTarget(best, cfg.damage);
+    playShot(weapon);
+  }
+
+  function swingFists(cfg) {
+    const p = ctx.player;
+    if (!p) return;
+    const px = p.group.position.x;
+    const pz = p.group.position.z;
+    const fx = Math.sin(p.heading);
+    const fz = Math.cos(p.heading);
+    let best = null;
+    let bestD = cfg.range;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      const tx = t.group.position.x;
+      const tz = t.group.position.z;
+      const d = dist2(px, pz, tx, tz);
+      // Reach is measured to the target's edge, so wide targets are hittable.
+      const edge = d - (t.radius || 0);
+      if (edge > bestD) continue;
+      // Must be in front of the player, not behind.
+      const dot = ((tx - px) * fx + (tz - pz) * fz) / (d || 1);
+      if (dot < 0.5) continue;
+      best = t;
+      bestD = edge;
+    }
+    if (best) damageTarget(best, cfg.damage);
+    playShot('fists');
+  }
+
+  function setWeapon(name) {
+    if (state.weapon === name) return;
+    state.weapon = name;
+    reloading = null;
+    reloadTimer = 0;
+  }
+
+  function cycleWeapon(step) {
+    const i = ORDER.indexOf(state.weapon);
+    const next = ORDER[(i + step + ORDER.length) % ORDER.length];
+    setWeapon(next);
+  }
+
+  function startReload() {
+    const w = state.weapon;
+    if (w === 'fists' || reloading) return;
+    const key = RESERVE_KEY[w];
+    if (mags[w] >= WEAPONS[w].mag || state[key] <= 0) return;
+    reloading = w;
+    reloadTimer = WEAPONS[w].reload;
+  }
+
+  function finishReload() {
+    const w = reloading;
+    const key = RESERVE_KEY[w];
+    const need = WEAPONS[w].mag - mags[w];
+    const take = Math.min(need, state[key]);
+    mags[w] += take;
+    state[key] -= take;
+    reloading = null;
+    reloadTimer = 0;
+  }
+
+  function tryFire() {
+    if (cooldown > 0 || reloading) return;
+    const w = state.weapon;
+    const cfg = WEAPONS[w];
+    if (!cfg) return;
+    if (w === 'fists') {
+      swingFists(cfg);
+      cooldown = cfg.delay;
+      return;
+    }
+    if (mags[w] <= 0) {
+      startReload();
+      return;
+    }
+    mags[w] -= 1;
+    fireGun(w, cfg);
+    cooldown = cfg.delay;
+    // Gunfire draws attention: a quiet street stops being quiet.
+    if (state.wanted === 0) state.wanted = 1;
+  }
+
+  function update(dt) {
+    // Fade the tracer and flash whether or not the game is running.
+    if (tracerLife > 0) {
+      tracerLife = Math.max(0, tracerLife - dt * 7);
+      tracerMat.opacity = tracerLife * 0.9;
+    }
+    if (flashLife > 0) {
+      flashLife = Math.max(0, flashLife - dt * 9);
+      flashMat.opacity = flashLife * 0.95;
+      if (flashLife <= 0) flash.visible = false;
+    }
+    if (cooldown > 0) cooldown -= dt;
+    if (reloading) {
+      reloadTimer -= dt;
+      if (reloadTimer <= 0) finishReload();
+    }
+    if (state.mode !== 'playing') return;
+    // Shooting is an on-foot activity; driving has its own controls.
+    const onFoot = !ctx.player || ctx.player.onFoot;
+    if (!onFoot) return;
+
+    if (input.pressed.has('Digit1')) setWeapon('fists');
+    else if (input.pressed.has('Digit2')) setWeapon('pistol');
+    else if (input.pressed.has('Digit3')) setWeapon('smg');
+    if (input.wheel > 0) cycleWeapon(1);
+    else if (input.wheel < 0) cycleWeapon(-1);
+    if (input.pressed.has('KeyR')) startReload();
+    if (input.firing) tryFire();
+  }
 
   return {
-    weapon: 'fists',
-    ammo: { pistol: 48, smg: 150 },
-    mag: { pistol: 12, smg: 30 },
-    magSize: { pistol: 12, smg: 30 },
-    cooldown: 0,
-    _reloadT: 0,
-    _reloadW: '',
-    _flashT: 0,
-    _traceT: 0,
-    _light: light,
-    _flash: flash,
-    _tracer: tracer,
-    _geo: geo,
+    update,
+    addTarget,
+    removeTarget,
+    // Read by the hud to show magazine counts and the reload state.
+    get mags() {
+      return mags;
+    },
+    get reloading() {
+      return reloading !== null;
+    },
   };
-}
-
-export function updateCombat(C, input, dt, G) {
-  if (G.state !== 'playing') return;
-
-  C.cooldown = Math.max(0, C.cooldown - dt);
-
-  // A finished reload tops the magazine back up.
-  if (C._reloadT > 0) {
-    C._reloadT -= dt;
-    if (C._reloadT <= 0) C.mag[C._reloadW] = C.magSize[C._reloadW];
-  }
-  if (C._flashT > 0) {
-    C._flashT -= dt;
-    if (C._flashT <= 0) {
-      C._light.visible = false;
-      C._flash.visible = false;
-    }
-  }
-  if (C._traceT > 0) {
-    C._traceT -= dt;
-    C._tracer.material.opacity = Math.max(0, C._traceT / 0.08) * 0.9;
-    if (C._traceT <= 0) C._tracer.visible = false;
-  }
-
-  const P = G.player;
-  if (!P) return;
-
-  // Weapon select: number keys pick directly, the wheel swaps the two guns.
-  if (input.pressed.has('Digit1')) C.weapon = 'fists';
-  if (input.pressed.has('Digit2')) C.weapon = 'pistol';
-  if (input.pressed.has('Digit3')) C.weapon = 'smg';
-  if (input.wheel) {
-    if (input.wheel > 0) C.weapon = C.weapon === 'pistol' ? 'smg' : 'pistol';
-    else C.weapon = C.weapon === 'smg' ? 'pistol' : 'smg';
-  }
-  if (
-    input.pressed.has('KeyR') &&
-    C.weapon !== 'fists' &&
-    C.mag[C.weapon] < C.magSize[C.weapon] &&
-    C._reloadT <= 0
-  ) {
-    C._reloadT = 1;
-    C._reloadW = C.weapon;
-  }
-
-  // Behind the wheel the click is the horn, not a weapon.
-  if (!P.onFoot) {
-    if (input.mouseClicked && G.audio) G.audio.honk();
-    return;
-  }
-
-  // With a gun drawn, Rae faces the mouse aim point.
-  const aim = G.input.aim;
-  if ((C.weapon === 'pistol' || C.weapon === 'smg') && aim) {
-    P.angle = Math.atan2(aim.z - P.z, aim.x - P.x);
-    P.heading = P.angle;
-    P.mesh.rotation.y = -P.angle;
-  }
-
-  if (!input.mouseClicked) return;
-
-  if (C.weapon === 'fists') {
-    if (C.cooldown > 0) return;
-    C.cooldown = 0.35;
-    const fwdX = Math.cos(P.angle);
-    const fwdZ = Math.sin(P.angle);
-    let target = null;
-    let targetSq = MELEE_RANGE * MELEE_RANGE;
-    let targetIsCop = false;
-    const scan = (list, isCop) => {
-      for (const t of list) {
-        if (isCop ? !t.alive : t.state === 'dead') continue;
-        const dx = t.x - P.x;
-        const dz = t.z - P.z;
-        const distSq = dx * dx + dz * dz;
-        if (distSq > targetSq) continue;
-        // Only hit what is in front of the swing.
-        if ((dx * fwdX + dz * fwdZ) / (Math.sqrt(distSq) || 1) < 0.5) continue;
-        targetSq = distSq;
-        target = t;
-        targetIsCop = isCop;
-      }
-    };
-    scan(G.traffic.peds, false);
-    scan(G.police.cops, true);
-    if (!target) return;
-    target.x += fwdX * 1.2;
-    target.z += fwdZ * 1.2;
-    damagePerson(target, 34, targetIsCop);
-    if (G.audio) G.audio.punch();
-    if (targetIsCop) G.police.addWanted(1);
-    return;
-  }
-
-  // Guns: respect the fire rate and any reload in progress.
-  if (C._reloadT > 0 || C.cooldown > 0) return;
-  const gun = C.weapon;
-  if (C.mag[gun] <= 0) {
-    C._reloadT = 1;
-    C._reloadW = gun;
-    return;
-  }
-  C.mag[gun]--;
-  C.cooldown = gun === 'pistol' ? 0.28 : 0.09;
-
-  let dirX = Math.cos(P.angle);
-  let dirZ = Math.sin(P.angle);
-  if (aim) {
-    const aimLen = Math.hypot(aim.x - P.x, aim.z - P.z);
-    if (aimLen > 0.01) {
-      dirX = (aim.x - P.x) / aimLen;
-      dirZ = (aim.z - P.z) / aimLen;
-    }
-  }
-  const gunX = P.x + dirX * 0.7;
-  const gunZ = P.z + dirZ * 0.7;
-  C._light.position.set(gunX, 1.4, gunZ);
-  C._light.intensity = 3;
-  C._light.visible = true;
-  C._flash.position.set(gunX, 1.4, gunZ);
-  if (G.camera) C._flash.lookAt(G.camera.position);
-  C._flash.visible = true;
-  C._flashT = 0.05;
-
-  // Raycast along the shot; the nearest thing in the path takes the hit.
-  let hitDist = SHOT_RANGE;
-  let hit = null;
-  let hitCop = false;
-  let hitCar = false;
-  const cast = (list, radius, isCop, isCar) => {
-    for (const t of list) {
-      if (isCar) {
-        if (!t.alive || t.driver === 'player') continue;
-      } else if (isCop ? !t.alive : t.state === 'dead') continue;
-      const relX = t.x - P.x;
-      const relZ = t.z - P.z;
-      const along = relX * dirX + relZ * dirZ;
-      if (along < 0 || along > SHOT_RANGE || along >= hitDist) continue;
-      const offSq = relX * relX + relZ * relZ - along * along;
-      if (offSq > radius * radius) continue;
-      hitDist = along;
-      hit = t;
-      hitCop = isCop;
-      hitCar = isCar;
-    }
-  };
-  cast(G.traffic.peds, 2.2, false, false);
-  cast(G.police.cops, 2.2, true, false);
-  cast(G.vehicles, 2.5, false, true);
-
-  const points = C._geo.attributes.position.array;
-  points[0] = gunX;
-  points[1] = 1.4;
-  points[2] = gunZ;
-  points[3] = P.x + dirX * hitDist;
-  points[4] = 1.25;
-  points[5] = P.z + dirZ * hitDist;
-  C._geo.attributes.position.needsUpdate = true;
-  C._tracer.material.opacity = 0.9;
-  C._tracer.visible = true;
-  C._traceT = 0.08;
-
-  if (G.audio) G.audio.gunshot(gun);
-  G.lastShot = { x: P.x, z: P.z, time: G.time };
-
-  let heat = false;
-  if (hit) {
-    const dmg = gun === 'pistol' ? 50 : 26;
-    if (hitCar) damageVehicle(hit, dmg);
-    else {
-      damagePerson(hit, dmg, hitCop);
-      heat = true;
-    }
-  }
-  // Even a miss draws heat if a cop is close enough to hear the shot.
-  if (!heat) {
-    for (const cop of G.police.cops) {
-      if (!cop.alive) continue;
-      const cx = cop.x - P.x;
-      const cz = cop.z - P.z;
-      if (cx * cx + cz * cz < 1600) {
-        heat = true;
-        break;
-      }
-    }
-  }
-  if (heat) G.police.addWanted(1);
 }

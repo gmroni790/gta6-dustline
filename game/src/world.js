@@ -1,441 +1,491 @@
-import * as THREE from 'three';
+// Dustline — world.js
+//
+// Builds the whole desert highway city: a sand plain crossed by an
+// asphalt road grid, adobe Old Town in the west, glass towers downtown,
+// a canyon rim along the east edge, a quarry in the north-east and a
+// truck stop in the south. Every placement comes from the shared seeded
+// rng, so one seed always builds the same city.
+//
+// The factory returns a description of the city that the other modules
+// drive on, walk through and collide with.
 
-// Dustline: a sun-baked desert highway town. x runs east, z runs south, y is up,
-// ground plane is y = 0 and the playable square spans [-B, B] on both axes.
-const B = 230;
-const TOWER_COLORS = [0xc96f4a, 0xb85c38, 0xd98d5f, 0xa8502e, 0xcf7a52, 0xe0a878];
-const ADOBE_COLORS = [0xd9a066, 0xc98d54, 0xe0b184, 0xbd7f4e];
-const NEON_COLORS = [0xff2e88, 0x22d3ee, 0xffcc00];
+import * as THREE from '../vendor/three.module.min.js';
+import { clamp } from './utils.js';
 
-export function createWorld(scene, rng) {
-  const rand = rng || Math.random;
-  const between = (lo, hi) => lo + rand() * (hi - lo);
-  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+// Road centre lines, in world units. Roads run the full width of the
+// playable area, so the blocks between them are 100 units apart.
+const GRID = [-300, -200, -100, 0, 100, 200, 300];
+const ROAD_HALF = 6; // half the asphalt width
+const WALK_HALF = 8.5; // half the sidewalk width
+const EDGE = 380; // where the north-south roads end
+const EAST_END = 360; // where east-west roads stop, short of the canyon
 
-  const group = new THREE.Group();
-  scene.add(group);
-  scene.background = new THREE.Color(0xf0cf9e);
-  scene.fog = new THREE.Fog(0xeccfa3, 140, 480);
+export function createWorld(ctx) {
+  const { scene, rng } = ctx;
 
-  // Shared material cache: one material per (color, roughness) pair.
-  const materialCache = new Map();
-  function material(color, roughness = 0.9) {
-    const key = color + '|' + roughness;
-    if (!materialCache.has(key)) {
-      materialCache.set(key, new THREE.MeshStandardMaterial({ color, roughness, metalness: 0 }));
-    }
-    return materialCache.get(key);
-  }
+  // --- sky, haze and light ------------------------------------------------
+  // A hazy pale-blue sky, warm sun and dusty ground bounce. Only two
+  // lights in the whole scene, to stay cheap on a software renderer.
+  scene.background = new THREE.Color(0x9fc3d8);
+  scene.fog = new THREE.Fog(0xd8c49a, 170, 720);
 
-  const colliders = [];
-  function addCollider(x, z, halfW, halfD) {
-    colliders.push({ x, z, hw: halfW, hd: halfD });
-  }
+  const sun = new THREE.DirectionalLight(0xffe2b0, 1.25);
+  sun.position.set(160, 240, 90);
+  scene.add(sun);
+  const sky = new THREE.HemisphereLight(0xbfd9e8, 0xc9a06b, 0.95);
+  scene.add(sky);
 
-  function addBox(w, h, d, color, x, y, z, rotY = 0) {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material(color));
-    mesh.position.set(x, y, z);
-    mesh.rotation.y = rotY;
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    group.add(mesh);
-    return mesh;
-  }
-
-  // Ground plane.
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), material(0xd9b380, 1));
+  // --- ground ---------------------------------------------------------------
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(960, 960),
+    new THREE.MeshLambertMaterial({ color: 0xd9b380 })
+  );
   ground.rotation.x = -Math.PI / 2;
-  ground.receiveShadow = true;
-  group.add(ground);
+  scene.add(ground);
 
-  // ---- Roads ----
+  // --- road network ---------------------------------------------------------
+  // North-south roads run the full depth; east-west roads stop short of
+  // the canyon rim so no road ever runs under a rock formation.
   const roads = [];
-  const gridLines = [-80, -40, 0, 40, 80];
-  for (const v of gridLines) {
-    roads.push({ x1: v, z1: -100, x2: v, z2: 100 });
-    roads.push({ x1: -100, z1: v, x2: 100, z2: v });
-  }
-  roads.push({ x1: -B, z1: -140, x2: B, z2: -140 }); // the highway
-  const ring = [
-    [-160, -160, 160, -160], [160, -160, 160, 160],
-    [160, 160, -160, 160], [-160, 160, -160, -160],
-  ];
-  for (const seg of ring) roads.push({ x1: seg[0], z1: seg[1], x2: seg[2], z2: seg[3] });
+  for (const x of GRID) roads.push({ ax: x, az: -EDGE, bx: x, bz: EDGE });
+  for (const z of GRID) roads.push({ ax: -EDGE, az: z, bx: EAST_END, bz: z });
 
-  // One dashed yellow centre-line texture, tiled per road.
-  const dashCanvas = document.createElement('canvas');
-  dashCanvas.width = 16;
-  dashCanvas.height = 64;
-  const dashCtx = dashCanvas.getContext('2d');
-  dashCtx.fillStyle = '#f5d76e';
-  dashCtx.fillRect(6, 10, 4, 44);
-  const dashTexture = new THREE.CanvasTexture(dashCanvas);
-  dashTexture.wrapS = dashTexture.wrapT = THREE.RepeatWrapping;
-
-  function renderRoad(road, width) {
-    const len = Math.hypot(road.x2 - road.x1, road.z2 - road.z1);
-    const cx = (road.x1 + road.x2) / 2;
-    const cz = (road.z1 + road.z2) / 2;
-    const horizontal = road.z1 === road.z2;
-    const strip = new THREE.Mesh(
-      new THREE.BoxGeometry(horizontal ? len : width, 0.06, horizontal ? width : len),
-      material(0x4a4038, 1));
-    strip.position.set(cx, 0.03, cz);
-    strip.receiveShadow = true;
-    group.add(strip);
-    const lineTex = dashTexture.clone();
-    lineTex.needsUpdate = true;
-    lineTex.repeat.set(1, Math.max(1, Math.round(len / 8)));
-    const line = new THREE.Mesh(new THREE.PlaneGeometry(0.5, len),
-      new THREE.MeshBasicMaterial({ map: lineTex, transparent: true, depthWrite: false }));
-    line.rotation.set(-Math.PI / 2, 0, horizontal ? Math.PI / 2 : 0);
-    line.position.set(cx, 0.08, cz);
-    group.add(line);
-  }
-  for (let i = 0; i < roads.length; i++) renderRoad(roads[i], i === 10 ? 12 : 8);
-
-  // ---- Canvas-texture signs ----
-  function makeSignTexture(text, bg, fg, sub) {
-    const cv = document.createElement('canvas');
-    cv.width = 512;
-    cv.height = 256;
-    const c = cv.getContext('2d');
-    c.fillStyle = bg;
-    c.fillRect(0, 0, 512, 256);
-    c.strokeStyle = fg;
-    c.lineWidth = 10;
-    c.strokeRect(12, 12, 488, 232);
-    c.fillStyle = fg;
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.font = 'bold 62px sans-serif';
-    c.fillText(text, 256, sub ? 96 : 128);
-    if (sub) {
-      c.font = 'bold 34px sans-serif';
-      c.fillText(sub, 256, 182);
-    }
-    const tex = new THREE.CanvasTexture(cv);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return tex;
-  }
-  function addSign(text, bg, fg, w, h, x, y, z, rotY, sub) {
-    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-      new THREE.MeshBasicMaterial({ map: makeSignTexture(text, bg, fg, sub) }));
-    mesh.position.set(x, y, z);
-    mesh.rotation.y = rotY;
-    group.add(mesh);
-    return mesh;
+  // Every grid crossing is an intersection, for traffic to turn at.
+  const intersections = [];
+  for (const x of GRID) {
+    for (const z of GRID) intersections.push({ x, z });
   }
 
-  // Neon strips that blink in update().
-  const blinkMats = [];
-  function addNeon(w, h, color, x, y, z, rotY) {
-    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h),
-      new THREE.MeshStandardMaterial({ color: 0x111111, emissive: color, emissiveIntensity: 2 }));
-    mesh.position.set(x, y, z);
-    mesh.rotation.y = rotY;
-    group.add(mesh);
-    blinkMats.push(mesh.material);
-    return mesh;
-  }
-
-  // ---- Downtown towers; block (20, 20) stays a plaza (the spawn sits there). ----
-  for (const bx of [-60, -20, 20, 60]) {
-    for (const bz of [-60, -20, 20, 60]) {
-      if (bx === 20 && bz === 20) continue;
-      const twin = rand() < 0.5;
-      const count = twin ? 2 : 1;
-      for (let i = 0; i < count; i++) {
-        const w = twin ? between(10, 14) : between(14, 20);
-        const d = twin ? between(10, 14) : between(14, 20);
-        const h = between(20, 60);
-        const x = bx + (twin ? (i === 0 ? -8.5 : 8.5) : 0) + between(-2, 2);
-        const z = bz + between(-3, 3);
-        addBox(w, h, d, pick(TOWER_COLORS), x, h / 2, z);
-        addBox(w + 0.6, 0.8, d + 0.6, 0xf2e3c6, x, h + 0.4, z);
-        for (let y = 6; y < h - 2; y += 12) addBox(w + 0.2, 0.7, d + 0.2, 0x33303a, x, y, z);
-        addCollider(x, z, w / 2 + 0.5, d / 2 + 0.5);
-        if (rand() < 0.4) {
-          addNeon(between(4, 8), 1.2, pick(NEON_COLORS), x, between(8, h - 4), z + d / 2 + 0.15, 0);
-        }
-      }
-    }
-  }
-
-  // ---- Old Town: low adobe blocks around (-120, -80), plazas kept clear. ----
-  for (let gx = -150; gx <= -90; gx += 15) {
-    for (let gz = -110; gz <= -50; gz += 15) {
-      if (Math.hypot(gx + 120, gz + 80) < 14) continue;
-      if (Math.hypot(gx + 110, gz + 70) < 10) continue;
-      if (rand() < 0.3) continue;
-      const w = between(8, 12), d = between(8, 12), h = between(4, 8);
-      const x = gx + between(-2, 2), z = gz + between(-2, 2);
-      addBox(w, h, d, pick(ADOBE_COLORS), x, h / 2, z);
-      addBox(w + 0.8, 0.5, d + 0.8, 0x8a5a34, x, h + 0.25, z);
-      addCollider(x, z, w / 2 + 0.5, d / 2 + 0.5);
-    }
-  }
-
-  // ---- Truck stop at (170, -140): diner, gas pumps, canopy, GAS pole sign. ----
-  addBox(16, 5, 9, 0xe8dcc0, 170, 2.5, -128);
-  addCollider(170, -128, 8.5, 5);
-  addSign('DINER', '#7a2e1d', '#ffd9a0', 10, 2.5, 170, 6.5, -132.6, Math.PI);
-  for (let i = 0; i < 4; i++) {
-    const px = 158 + i * 4;
-    addBox(1, 1.6, 0.7, 0xc23b2e, px, 0.8, -134);
-    addCollider(px, -134, 0.8, 0.6);
-  }
-  addBox(20, 0.5, 6, 0xf2e3c6, 164, 4.5, -134);
-  addBox(0.4, 4.5, 0.4, 0x888888, 155, 2.25, -136.5);
-  addBox(0.4, 4.5, 0.4, 0x888888, 173, 2.25, -136.5);
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 14, 8), material(0x777777, 0.6));
-  pole.position.set(182, 7, -130);
-  pole.castShadow = true;
-  group.add(pole);
-  addSign('GAS', '#123a5c', '#ffe066', 9, 4.5, 182, 15, -130, Math.PI);
-  addCollider(182, -130, 1, 1);
-
-  // ---- Quarry at (-170, -170): terraced pit, stepped open rings descending inward. ----
-  for (let i = 0; i < 4; i++) {
-    const radius = 30 - i * 7;
-    const height = 8 - i * 2;
-    const ringMesh = new THREE.Mesh(
-      new THREE.CylinderGeometry(radius, radius + 3, height, 24, 1, true),
-      new THREE.MeshStandardMaterial({ color: 0xa97a4e, roughness: 1, side: THREE.DoubleSide }));
-    ringMesh.position.set(-170, height / 2, -170);
-    ringMesh.castShadow = true;
-    ringMesh.receiveShadow = true;
-    group.add(ringMesh);
-  }
-
-  // ---- Canyon Rim at (0, 190): tall rock formations plus an overlook platform. ----
-  const crags = [[-28, 168], [24, 172], [-14, 208], [30, 205], [-38, 192], [42, 188], [8, 214], [-8, 166]];
-  for (const [cx, cz] of crags) {
-    const w = between(6, 10), d = between(6, 10), h = between(15, 32);
-    addBox(w, h, d, pick([0xa85a36, 0x96502e, 0xb96a42]), cx, h / 2, cz, between(0, 0.6));
-    addBox(w * 0.6, between(2, 5), d * 0.6, 0x8a4a28, cx + between(-1, 1), h + 1.5, cz + between(-1, 1));
-    addCollider(cx, cz, w / 2 + 1, d / 2 + 1);
-  }
-  addBox(10, 1, 6, 0x9a7a5a, 0, 0.5, 178);
-  addCollider(0, 178, 5, 3);
-
-  // ---- Dunes at (-190, 60): smooth squashed sand mounds. ----
-  for (let i = 0; i < 9; i++) {
-    const mound = new THREE.Mesh(new THREE.SphereGeometry(between(9, 18), 16, 12), material(0xe3c184, 1));
-    mound.scale.y = 0.22;
-    mound.position.set(-190 + between(-25, 25), 0, 60 + between(-25, 25));
-    mound.receiveShadow = true;
-    group.add(mound);
-  }
-
-  // ---- Desert Rose paint shop at (30, 110); door faces north toward downtown. ----
-  addBox(13, 5.5, 10, 0xf0e2c8, 30, 2.75, 110);
-  addCollider(30, 110, 7, 5.5);
-  addBox(9, 3.6, 0.3, 0x5a5a66, 30, 1.8, 104.9);
-  addSign('DESERT ROSE', '#8e2f4b', '#ffd9e0', 11, 2.6, 30, 6.8, 104.8, Math.PI, 'AUTO PAINT');
-
-  // ---- Rae's Garage hideout at (-110, -70); door faces south. ----
-  addBox(11, 5, 9, 0xb0653a, -110, 2.5, -70);
-  addCollider(-110, -70, 6, 5);
-  addBox(8, 3.4, 0.3, 0x3a3a44, -110, 1.7, -65.4);
-  addSign("RAE'S", '#2e4a2e', '#ffe9a8', 8, 2, -110, 6, -65.4, 0, 'GARAGE');
-
-  // ---- Relic spots: on roads/plazas, never inside a collider. ----
-  const relicSpots = [
-    { x: 0, z: 0 }, { x: 40, z: -40 }, { x: -80, z: 80 }, { x: 0, z: -140 },
-    { x: 120, z: -140 }, { x: 30, z: 100 }, { x: -110, z: -58 }, { x: -170, z: -170 },
-    { x: 0, z: 190 }, { x: -190, z: 60 },
-  ];
-
-  // ---- Props ----
-  function addCactus(x, z, scale) {
-    const g = new THREE.Group();
-    const green = material(0x4a7c3a, 1);
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.35 * scale, 0.45 * scale, 3 * scale, 8), green);
-    trunk.position.y = 1.5 * scale;
-    trunk.castShadow = true;
-    g.add(trunk);
-    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.25 * scale, 0.25 * scale, 1.4 * scale, 8), green);
-    arm.position.set(0.8 * scale, 2 * scale, 0);
-    arm.rotation.z = Math.PI / 2;
-    arm.castShadow = true;
-    g.add(arm);
-    const up = new THREE.Mesh(new THREE.CylinderGeometry(0.25 * scale, 0.25 * scale, 1.2 * scale, 8), green);
-    up.position.set(1.4 * scale, 2.5 * scale, 0);
-    up.castShadow = true;
-    g.add(up);
-    g.position.set(x, 0, z);
-    g.rotation.y = between(0, Math.PI * 2);
-    group.add(g);
-  }
-  function addRock(x, z, size, solid) {
-    const mesh = new THREE.Mesh(new THREE.DodecahedronGeometry(size, 0),
-      material(pick([0x9a7a5a, 0x8a6a4a, 0xa8855f]), 1));
-    mesh.scale.y = 0.6;
-    mesh.position.set(x, size * 0.4, z);
-    mesh.rotation.y = between(0, 6.28);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    group.add(mesh);
-    if (solid) addCollider(x, z, size, size);
-  }
-  function addPalm(x, z) {
-    const g = new THREE.Group();
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.4, 6, 7), material(0x8a6a44, 1));
-    trunk.position.y = 3;
-    trunk.rotation.z = 0.12;
-    trunk.castShadow = true;
-    g.add(trunk);
-    for (let i = 0; i < 6; i++) {
-      const a = i * Math.PI / 3;
-      const frond = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.08, 0.7), material(0x3f7a34, 1));
-      frond.position.set(Math.cos(a) * 1.6, 5.9, Math.sin(a) * 1.6);
-      frond.rotation.set(0, -a, -0.35);
-      frond.castShadow = true;
-      g.add(frond);
-    }
-    g.position.set(x, 0, z);
-    group.add(g);
-  }
-  function addStreetlight(x, z) {
-    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 7, 6), material(0x555555, 0.6));
-    post.position.set(x, 3.5, z);
-    post.castShadow = true;
-    group.add(post);
-    const head = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.25, 0.5),
-      new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0xffe9a8, emissiveIntensity: 1.2 }));
-    head.position.set(x + 0.7, 7, z);
-    group.add(head);
-  }
-  function addBillboard(x, z, rotY, text, bg, fg, sub) {
-    const dx = Math.cos(rotY) * 3;
-    const dz = -Math.sin(rotY) * 3;
-    for (const s of [-1, 1]) {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.3, 7, 6), material(0x666666, 0.6));
-      post.position.set(x + dx * s, 3.5, z + dz * s);
-      post.castShadow = true;
-      group.add(post);
-    }
-    const face = new THREE.Mesh(new THREE.PlaneGeometry(11, 4.5),
-      new THREE.MeshBasicMaterial({ map: makeSignTexture(text, bg, fg, sub) }));
-    face.position.set(x, 8.5, z);
-    face.rotation.y = rotY;
-    group.add(face);
-    const back = new THREE.Mesh(new THREE.PlaneGeometry(11, 4.5), material(0x3a3a3a));
-    back.position.set(x, 8.5, z);
-    back.rotation.y = rotY + Math.PI;
-    group.add(back);
-    addCollider(x, z, 1.5, 1.5);
-  }
-  addBillboard(60, -131, Math.PI, 'DUSTLINE', '#1d3557', '#ffd166', 'POP. 12,404');
-  addBillboard(150, -131, Math.PI, 'GAS', '#7a2e1d', '#ffe9a8', 'LAST STOP 40 MI');
-  addBillboard(-150, 40, Math.PI / 2, 'MOTEL', '#2e4a2e', '#ffd166', 'VACANCY');
-
-  const palmSpots = [
-    [14, 14], [26, 14], [14, 26], [26, 26], [6, -30],
-    [-6, 30], [30, -6], [-30, 6], [46, 6], [-46, -6],
-  ];
-  for (const [px, pz] of palmSpots) addPalm(px, pz);
-  for (let v = -80; v <= 80; v += 40) {
-    addStreetlight(5.5, v);
-    addStreetlight(v, 5.5);
-  }
-
-  // ---- Scattered cacti and rocks, kept clear of roads, colliders and relics. ----
-  function distanceToRoad(x, z) {
-    let best = Infinity;
+  // True when (x, z) sits on a road, plus a safety margin.
+  function nearRoad(x, z, pad) {
     for (const r of roads) {
-      const dx = r.x2 - r.x1, dz = r.z2 - r.z1;
-      const len2 = dx * dx + dz * dz || 1;
-      let t = ((x - r.x1) * dx + (z - r.z1) * dz) / len2;
-      t = Math.max(0, Math.min(1, t));
-      best = Math.min(best, Math.hypot(x - (r.x1 + dx * t), z - (r.z1 + dz * t)));
-    }
-    return best;
-  }
-  function isClear(x, z, margin) {
-    if (distanceToRoad(x, z) < 7) return false;
-    for (const c of colliders) {
-      if (Math.abs(x - c.x) < c.hw + margin && Math.abs(z - c.z) < c.hd + margin) return false;
-    }
-    for (const s of relicSpots) if (Math.hypot(x - s.x, z - s.z) < 6) return false;
-    if (Math.hypot(x - 10, z - 20) < 10) return false;
-    return true;
-  }
-  let placed = 0, attempts = 0;
-  while (placed < 46 && attempts++ < 800) {
-    const x = between(-220, 220), z = between(-220, 220);
-    if (!isClear(x, z, 1)) continue;
-    addCactus(x, z, between(0.8, 1.6));
-    placed++;
-  }
-  placed = 0;
-  attempts = 0;
-  while (placed < 30 && attempts++ < 800) {
-    const x = between(-220, 220), z = between(-220, 220);
-    if (!isClear(x, z, 2)) continue;
-    addRock(x, z, between(0.8, 2.2), rand() < 0.4);
-    placed++;
-  }
-  // Extra rocks ringing the quarry and the canyon.
-  for (let i = 0; i < 8; i++) {
-    const a = between(0, Math.PI * 2);
-    addRock(-170 + Math.cos(a) * between(32, 40), -170 + Math.sin(a) * between(32, 40), between(1, 2.4), true);
-    addRock(Math.cos(a) * between(44, 55), 190 + Math.sin(a) * between(18, 30), between(1, 2.4), true);
-  }
-
-  // ---- Drifting dust motes ----
-  const DUST_COUNT = 380;
-  const dustPos = new Float32Array(DUST_COUNT * 3);
-  for (let i = 0; i < DUST_COUNT; i++) {
-    dustPos[i * 3] = between(-B, B);
-    dustPos[i * 3 + 1] = between(0.5, 26);
-    dustPos[i * 3 + 2] = between(-B, B);
-  }
-  const dustGeo = new THREE.BufferGeometry();
-  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
-  const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({
-    color: 0xe8c88f, size: 0.9, transparent: true, opacity: 0.55, depthWrite: false,
-  }));
-  group.add(dust);
-
-  function collides(x, z, r) {
-    if (Math.abs(x) + r > B || Math.abs(z) + r > B) return true;
-    for (const c of colliders) {
-      if (Math.abs(x - c.x) < c.hw + r && Math.abs(z - c.z) < c.hd + r) return true;
+      if (r.ax === r.bx) {
+        if (Math.abs(x - r.ax) < ROAD_HALF + pad && z >= r.az - pad && z <= r.bz + pad) return true;
+      } else if (Math.abs(z - r.az) < ROAD_HALF + pad && x >= r.ax - pad && x <= r.bx + pad) {
+        return true;
+      }
     }
     return false;
   }
 
-  function update(dt, t) {
+  // --- named places and relic spots -----------------------------------------
+  // Declared before the buildings so construction keeps clear of them.
+  const places = {
+    playerStart: { x: 0, z: 20 },
+    paintShop: { x: -60, z: -140 },
+    garage: { x: 60, z: 140 },
+    diner: { x: -140, z: 60 },
+    truckStop: { x: 0, z: 338 },
+    quarry: { x: 268, z: -268 },
+    canyonOverlook: { x: 352, z: 40 },
+    downtown: { x: 0, z: 0 },
+    highwayGate: { x: 0, z: 378 },
+  };
+
+  const relicSpots = [
+    { x: -260, z: -140, label: 'Old Well' },
+    { x: 60, z: -40, label: 'Downtown Plaza' },
+    { x: 250, z: -250, label: 'Quarry Edge' },
+    { x: 352, z: 60, label: 'Canyon Overlook' },
+    { x: -25, z: 350, label: 'Truck Stop Sign' },
+    { x: -320, z: 320, label: 'Dune Shrine' },
+    { x: 40, z: -360, label: 'North Dune' },
+    { x: 330, z: 250, label: 'Mesa Rock' },
+    { x: -140, z: 130, label: 'Diner Alley' },
+    { x: 180, z: -60, label: 'Highway Memorial' },
+  ];
+
+  // Circles that buildings and props must stay out of: the named places,
+  // the relic spots and the quarry pit itself.
+  const keepClear = [];
+  for (const p of Object.values(places)) keepClear.push({ x: p.x, z: p.z, r: 24 });
+  for (const s of relicSpots) keepClear.push({ x: s.x, z: s.z, r: 17 });
+  keepClear.push({ x: 268, z: -268, r: 34 });
+
+  function blocked(x, z, r) {
+    for (const k of keepClear) {
+      const dx = x - k.x;
+      const dz = z - k.z;
+      if (dx * dx + dz * dz < (r + k.r) * (r + k.r)) return true;
+    }
+    return false;
+  }
+
+  // --- road surfaces and centre dashes --------------------------------------
+  // Each road gets a pale sidewalk base with a dark asphalt strip on top.
+  // The centre dashes for every road live in one InstancedMesh.
+  const asphaltMat = new THREE.MeshLambertMaterial({ color: 0x35322e });
+  const walkMat = new THREE.MeshLambertMaterial({ color: 0xbfae8e });
+  const dashGeo = new THREE.PlaneGeometry(0.5, 3);
+  dashGeo.rotateX(-Math.PI / 2);
+  const dashMat = new THREE.MeshLambertMaterial({ color: 0xe8d97a });
+
+  let dashCount = 0;
+  for (const r of roads) {
+    const len = Math.abs(r.bx - r.ax) + Math.abs(r.bz - r.az);
+    dashCount += Math.floor(len / 14);
+  }
+  const dashes = new THREE.InstancedMesh(dashGeo, dashMat, dashCount);
+  const dummy = new THREE.Object3D();
+  let dashIndex = 0;
+
+  for (const r of roads) {
+    const vertical = r.ax === r.bx;
+    const len = vertical ? r.bz - r.az : r.bx - r.ax;
+    const cx = (r.ax + r.bx) / 2;
+    const cz = (r.az + r.bz) / 2;
+
+    const walk = new THREE.Mesh(
+      new THREE.PlaneGeometry(vertical ? WALK_HALF * 2 : len, vertical ? len : WALK_HALF * 2),
+      walkMat
+    );
+    walk.rotation.x = -Math.PI / 2;
+    walk.position.set(cx, 0.01, cz);
+    scene.add(walk);
+
+    const strip = new THREE.Mesh(
+      new THREE.PlaneGeometry(vertical ? ROAD_HALF * 2 : len, vertical ? len : ROAD_HALF * 2),
+      asphaltMat
+    );
+    strip.rotation.x = -Math.PI / 2;
+    strip.position.set(cx, 0.02, cz);
+    scene.add(strip);
+
+    const n = Math.floor(len / 14);
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / n;
+      dummy.position.set(
+        vertical ? cx : r.ax + (r.bx - r.ax) * t,
+        0.03,
+        vertical ? r.az + (r.bz - r.az) * t : cz
+      );
+      dummy.rotation.set(0, vertical ? 0 : Math.PI / 2, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      dashes.setMatrixAt(dashIndex++, dummy.matrix);
+    }
+  }
+  dashes.instanceMatrix.needsUpdate = true;
+  scene.add(dashes);
+
+  // --- buildings --------------------------------------------------------------
+  // One box per building, sharing a small set of materials. Blocks near
+  // the centre grow glass towers, the west stays low adobe, and the rest
+  // is mid-rise sandstone. Colliders are circles that never reach a road:
+  // footprints stay inside the block with room to spare.
+  const colliders = [];
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  const matSet = (colors) => colors.map((c) => new THREE.MeshLambertMaterial({ color: c }));
+  const adobeMats = matSet([0xc08a5e, 0xb57a4e, 0xcf9a6b]);
+  const stoneMats = matSet([0xd2a679, 0xc99a6b, 0xb98a5f, 0xe0c090]);
+  const glassMats = matSet([0x7fa8b8, 0x9db8c4, 0x6b8fa3, 0x8fa9b5]);
+
+  for (let gx = 0; gx < GRID.length - 1; gx++) {
+    for (let gz = 0; gz < GRID.length - 1; gz++) {
+      const cx = (GRID[gx] + GRID[gx + 1]) / 2;
+      const cz = (GRID[gz] + GRID[gz + 1]) / 2;
+      const downtown = Math.abs(cx) <= 150 && Math.abs(cz) <= 150;
+      const oldTown = cx < -200;
+      const mats = downtown ? glassMats : oldTown ? adobeMats : stoneMats;
+      const count = rng.int(2, 5);
+      const placed = [];
+
+      for (let n = 0; n < count; n++) {
+        let ok = false;
+        let bx = 0;
+        let bz = 0;
+        let w = 0;
+        let d = 0;
+        let h = 0;
+        for (let attempt = 0; attempt < 9 && !ok; attempt++) {
+          w = rng.range(10, 24);
+          d = rng.range(10, 24);
+          h = downtown ? rng.range(35, 85) : oldTown ? rng.range(6, 12) : rng.range(8, 26);
+          bx = cx + rng.range(-26, 26);
+          bz = cz + rng.range(-26, 26);
+          if (blocked(bx, bz, Math.hypot(w / 2, d / 2))) continue;
+          ok = true;
+          for (const p of placed) {
+            const overlapX = Math.abs(bx - p.x) < (w + p.w) / 2 + 4;
+            const overlapZ = Math.abs(bz - p.z) < (d + p.d) / 2 + 4;
+            if (overlapX && overlapZ) {
+              ok = false;
+              break;
+            }
+          }
+        }
+        if (!ok) continue;
+        const mesh = new THREE.Mesh(unitBox, rng.pick(mats));
+        mesh.scale.set(w, h, d);
+        mesh.position.set(bx, h / 2, bz);
+        scene.add(mesh);
+        placed.push({ x: bx, z: bz, w, d });
+        colliders.push({ x: bx, z: bz, radius: Math.hypot(w / 2, d / 2) * 0.8 });
+      }
+    }
+  }
+
+  // --- canyon rim ---------------------------------------------------------------
+  // Tall rock slabs along the east edge, set between the east-west roads
+  // so no formation ever stands on asphalt.
+  const rockMats = matSet([0xa85f3c, 0x96543a, 0xb56a44]);
+  const canyonZ = [-350, -250, -150, -50, 50, 150, 250, 350];
+  for (const z of canyonZ) {
+    for (const xBase of [372, 386]) {
+      const w = rng.range(10, 16);
+      const h = rng.range(18, 46);
+      const d = rng.range(14, 26);
+      const x = xBase + rng.range(-3, 3);
+      const zz = z + rng.range(-12, 12);
+      const slab = new THREE.Mesh(unitBox, rng.pick(rockMats));
+      slab.scale.set(w, h, d);
+      slab.position.set(x, h / 2 - 1, zz);
+      slab.rotation.y = rng.range(-0.15, 0.15);
+      scene.add(slab);
+      colliders.push({ x, z: zz, radius: Math.hypot(w / 2, d / 2) * 0.8 });
+    }
+  }
+
+  // --- quarry pit -----------------------------------------------------------------
+  // A dark scooped disc in the north-east block, ringed with boulders.
+  const pit = new THREE.Mesh(
+    new THREE.CircleGeometry(24, 28),
+    new THREE.MeshLambertMaterial({ color: 0x6b5a48 })
+  );
+  pit.rotation.x = -Math.PI / 2;
+  pit.position.set(268, 0.015, -268);
+  scene.add(pit);
+
+  const rimGeo = new THREE.DodecahedronGeometry(1.6, 0);
+  const rimMat = new THREE.MeshLambertMaterial({ color: 0x8a7a66 });
+  for (let i = 0; i < 9; i++) {
+    const a = (i / 9) * Math.PI * 2 + rng.range(-0.2, 0.2);
+    const rx = 268 + Math.cos(a) * 26;
+    const rz = -268 + Math.sin(a) * 26;
+    if (rx > 290) continue; // keep the boulders off the x = 300 road
+    const rock = new THREE.Mesh(rimGeo, rimMat);
+    rock.position.set(rx, 0.8, rz);
+    rock.scale.setScalar(rng.range(0.8, 1.8));
+    rock.rotation.y = rng.range(0, Math.PI);
+    scene.add(rock);
+    colliders.push({ x: rx, z: rz, radius: 2.2 });
+  }
+
+  // --- truck stop -------------------------------------------------------------------
+  // A wide lot in the south with fuel pumps under a canopy, a shop and a
+  // tall sign. The north-south road passes through the lot, as it should.
+  const lot = new THREE.Mesh(
+    new THREE.PlaneGeometry(120, 46),
+    new THREE.MeshLambertMaterial({ color: 0x9a938a })
+  );
+  lot.rotation.x = -Math.PI / 2;
+  lot.position.set(0, 0.012, 338);
+  scene.add(lot);
+
+  const pumpGeo = new THREE.BoxGeometry(1.2, 1.8, 0.8);
+  const pumpMat = new THREE.MeshLambertMaterial({ color: 0xc23b2a });
+  for (const px of [-30, -18, 18, 30]) {
+    const pump = new THREE.Mesh(pumpGeo, pumpMat);
+    pump.position.set(px, 0.9, 332);
+    scene.add(pump);
+    colliders.push({ x: px, z: 332, radius: 1.4 });
+  }
+
+  const canopy = new THREE.Mesh(
+    new THREE.BoxGeometry(70, 0.5, 14),
+    new THREE.MeshLambertMaterial({ color: 0xe8e0cc })
+  );
+  canopy.position.set(0, 6, 332);
+  scene.add(canopy);
+
+  const postGeo = new THREE.CylinderGeometry(0.15, 0.15, 6, 6);
+  const postMat = new THREE.MeshLambertMaterial({ color: 0x55504a });
+  for (const px of [-33, 33]) {
+    for (const pz of [326, 338]) {
+      const post = new THREE.Mesh(postGeo, postMat);
+      post.position.set(px, 3, pz);
+      scene.add(post);
+    }
+  }
+
+  const shop = new THREE.Mesh(unitBox, rng.pick(stoneMats));
+  shop.scale.set(18, 6, 11);
+  shop.position.set(48, 3, 350);
+  scene.add(shop);
+  colliders.push({ x: 48, z: 350, radius: 10 });
+
+  const signPole = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 14, 6), postMat);
+  signPole.position.set(-44, 7, 322);
+  scene.add(signPole);
+  const sign = new THREE.Mesh(
+    new THREE.BoxGeometry(6, 3, 0.5),
+    new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0xaa8800 })
+  );
+  sign.position.set(-44, 14, 322);
+  scene.add(sign);
+  colliders.push({ x: -44, z: 322, radius: 1.5 });
+
+  // --- streetlights -------------------------------------------------------------------
+  // Poles and heads along the two main roads, two InstancedMeshes total.
+  const lightSpots = [];
+  for (let z = -360; z <= 360; z += 40) lightSpots.push({ x: 8, z, horiz: false });
+  for (let x = -360; x <= 360; x += 40) lightSpots.push({ x, z: 8, horiz: true });
+
+  const poleGeo = new THREE.CylinderGeometry(0.14, 0.18, 7, 6);
+  const headGeo = new THREE.BoxGeometry(1.8, 0.25, 0.45);
+  const headMat = new THREE.MeshLambertMaterial({ color: 0xfff2c0, emissive: 0xffedb0 });
+  const poles = new THREE.InstancedMesh(poleGeo, postMat, lightSpots.length);
+  const heads = new THREE.InstancedMesh(headGeo, headMat, lightSpots.length);
+  lightSpots.forEach((s, i) => {
+    dummy.position.set(s.x, 3.5, s.z);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(1, 1, 1);
+    dummy.updateMatrix();
+    poles.setMatrixAt(i, dummy.matrix);
+    dummy.position.set(s.horiz ? s.x : s.x - 0.9, 7, s.horiz ? s.z - 0.9 : s.z);
+    dummy.rotation.set(0, s.horiz ? Math.PI / 2 : 0, 0);
+    dummy.updateMatrix();
+    heads.setMatrixAt(i, dummy.matrix);
+  });
+  poles.instanceMatrix.needsUpdate = true;
+  heads.instanceMatrix.needsUpdate = true;
+  scene.add(poles);
+  scene.add(heads);
+
+  // --- dunes: cacti and rocks -----------------------------------------------------------
+  // Rejection-sampled spots that avoid roads, buildings and named places.
+  // Trunks, arms and rocks are three InstancedMeshes between them.
+  function duneSpot(pad) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const x = rng.range(-390, 390);
+      const z = rng.range(-390, 390);
+      if (nearRoad(x, z, pad)) continue;
+      if (blocked(x, z, 6)) continue;
+      let inside = false;
+      for (const c of colliders) {
+        const dx = x - c.x;
+        const dz = z - c.z;
+        if (dx * dx + dz * dz < (c.radius + 4) * (c.radius + 4)) {
+          inside = true;
+          break;
+        }
+      }
+      if (!inside) return { x, z };
+    }
+    return null;
+  }
+
+  const cactusSpots = [];
+  for (let i = 0; i < 36; i++) {
+    const s = duneSpot(10);
+    if (s) cactusSpots.push(s);
+  }
+  if (cactusSpots.length > 0) {
+    const trunkGeo = new THREE.CylinderGeometry(0.45, 0.55, 1, 7);
+    const armGeo = new THREE.CylinderGeometry(0.28, 0.28, 1.6, 6);
+    armGeo.rotateZ(Math.PI / 2);
+    const cactusMat = new THREE.MeshLambertMaterial({ color: 0x4a7a3a });
+    const trunks = new THREE.InstancedMesh(trunkGeo, cactusMat, cactusSpots.length);
+    const arms = new THREE.InstancedMesh(armGeo, cactusMat, cactusSpots.length);
+    cactusSpots.forEach((s, i) => {
+      const h = rng.range(2.5, 5);
+      dummy.position.set(s.x, h / 2, s.z);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, h, 1);
+      dummy.updateMatrix();
+      trunks.setMatrixAt(i, dummy.matrix);
+      const a = rng.range(0, Math.PI * 2);
+      dummy.position.set(s.x + Math.cos(a) * 0.9, h * 0.55, s.z - Math.sin(a) * 0.9);
+      dummy.rotation.set(0, a, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      arms.setMatrixAt(i, dummy.matrix);
+    });
+    trunks.instanceMatrix.needsUpdate = true;
+    arms.instanceMatrix.needsUpdate = true;
+    scene.add(trunks);
+    scene.add(arms);
+  }
+
+  const rockSpots = [];
+  for (let i = 0; i < 28; i++) {
+    const s = duneSpot(10);
+    if (s) rockSpots.push(s);
+  }
+  if (rockSpots.length > 0) {
+    const boulderGeo = new THREE.DodecahedronGeometry(1, 0);
+    const boulderMat = new THREE.MeshLambertMaterial({ color: 0x9a8a72 });
+    const boulders = new THREE.InstancedMesh(boulderGeo, boulderMat, rockSpots.length);
+    rockSpots.forEach((s, i) => {
+      const sc = rng.range(0.8, 2.6);
+      dummy.position.set(s.x, sc * 0.4, s.z);
+      dummy.rotation.set(0, rng.range(0, Math.PI * 2), 0);
+      dummy.scale.set(sc, sc * 0.8, sc);
+      dummy.updateMatrix();
+      boulders.setMatrixAt(i, dummy.matrix);
+    });
+    boulders.instanceMatrix.needsUpdate = true;
+    scene.add(boulders);
+  }
+
+  // --- relic markers ------------------------------------------------------------
+  // A small glowing octahedron hovers over each relic spot so players can
+  // spot one from a distance. They spin and bob gently in update().
+  const markerGeo = new THREE.OctahedronGeometry(1.1, 0);
+  const markerMat = new THREE.MeshLambertMaterial({ color: 0xffd23f, emissive: 0xcc9900 });
+  const markers = [];
+  for (const s of relicSpots) {
+    const m = new THREE.Mesh(markerGeo, markerMat);
+    m.position.set(s.x, 2.2, s.z);
+    scene.add(m);
+    markers.push(m);
+  }
+
+  // --- drifting dust ----------------------------------------------------------------------
+  // One points cloud, blown east by the wind and wrapped around the map.
+  const DUST_COUNT = 380;
+  const dustPos = new Float32Array(DUST_COUNT * 3);
+  const dustBaseY = new Float32Array(DUST_COUNT);
+  const dustSpeed = new Float32Array(DUST_COUNT);
+  for (let i = 0; i < DUST_COUNT; i++) {
+    dustPos[i * 3] = rng.range(-400, 400);
+    dustPos[i * 3 + 1] = rng.range(0.5, 26);
+    dustPos[i * 3 + 2] = rng.range(-400, 400);
+    dustBaseY[i] = dustPos[i * 3 + 1];
+    dustSpeed[i] = rng.range(4, 12);
+  }
+  const dustGeo = new THREE.BufferGeometry();
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+  const dust = new THREE.Points(
+    dustGeo,
+    new THREE.PointsMaterial({ color: 0xe8d5a8, size: 1.7, transparent: true, opacity: 0.55 })
+  );
+  scene.add(dust);
+
+  let dustTime = 0;
+  function update(dt) {
+    dustTime += dt;
     for (let i = 0; i < DUST_COUNT; i++) {
-      dustPos[i * 3] += dt * (2 + (i % 3));
-      dustPos[i * 3 + 1] += Math.sin(t * 0.7 + i) * dt * 0.3;
-      if (dustPos[i * 3] > B) dustPos[i * 3] = -B;
+      let x = dustPos[i * 3] + dustSpeed[i] * dt;
+      if (x > 400) x -= 800;
+      dustPos[i * 3] = x;
+      dustPos[i * 3 + 1] = clamp(dustBaseY[i] + Math.sin(dustTime * 0.6 + i * 1.7) * 0.9, 0.3, 30);
     }
     dustGeo.attributes.position.needsUpdate = true;
-    blinkMats.forEach((m, i) => {
-      m.emissiveIntensity = Math.sin(t * 2.5 + i * 1.7) > -0.2 ? 2.2 : 0.3;
-    });
+    for (let i = 0; i < markers.length; i++) {
+      markers[i].rotation.y += dt * 0.8;
+      markers[i].position.y = 2.2 + Math.sin(dustTime * 1.5 + i) * 0.4;
+    }
   }
 
   return {
-    group, roads, colliders, collides, update,
-    spawn: { x: 10, z: 20, angle: -Math.PI / 2 },
-    paintShop: { x: 30, z: 110, r: 7 },
-    hideout: { x: -110, z: -70, r: 8 },
-    spots: {
-      truckStop: { x: 170, z: -140 }, quarry: { x: -170, z: -170 }, canyon: { x: 0, z: 190 },
-      downtown: { x: 0, z: 0 }, oldTown: { x: -120, z: -80 }, dunes: { x: -190, z: 60 },
-      highway: { x: 0, z: -140 },
-    },
+    roads,
+    intersections,
+    colliders,
+    places,
     relicSpots,
-    districts: [
-      { name: 'Downtown', x: 0, z: 0 }, { name: 'Old Town', x: -120, z: -80 },
-      { name: 'Truck Stop', x: 170, z: -140 }, { name: 'Quarry', x: -170, z: -170 },
-      { name: 'Canyon Rim', x: 0, z: 190 }, { name: 'Dunes', x: -190, z: 60 },
-      { name: 'Highway', x: 0, z: -140 },
-    ],
-    bounds: B,
+    bounds: { minX: -400, maxX: 400, minZ: -400, maxZ: 400 },
+    groundHeight: () => 0,
+    update,
   };
 }

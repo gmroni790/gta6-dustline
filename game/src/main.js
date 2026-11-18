@@ -1,268 +1,381 @@
-import * as THREE from 'three';
-import { mulberry32 } from './utils.js';
+// Dustline boot and game loop: builds the renderer, the shared context and
+// every module, then runs the frame loop. Input is gathered from DOM events,
+// the world advances in fixed steps, and the camera follows Rae.
+//
+// ?seed=N fixes the city's random layout. ?shot=cover|street|chase|mission
+// (with &seed=N) stages that scene for a screenshot: the game starts
+// playing at once, advances on a fixed one-thirtieth step several steps per
+// frame, and sets window.__shotReady once the scene is painted.
+import * as THREE from '../vendor/three.module.min.js';
+import { Rng, clamp, damp, angleLerp } from './utils.js';
 import { createWorld } from './world.js';
-import { makeVehicle, VEHICLE_TYPES } from './vehicles.js';
+import { createVehicles } from './vehicles.js';
 import { createTraffic } from './traffic.js';
-import { createPlayer, updatePlayer } from './player.js';
-import { createCombat, updateCombat } from './combat.js';
+import { createPlayer } from './player.js';
+import { createCombat } from './combat.js';
 import { createPolice } from './police.js';
 import { createMissions } from './missions.js';
-import { createHUD } from './hud.js';
 import { createAudio } from './audio.js';
-import { saveGame, loadGame, hasSave } from './save.js';
+import { createSave } from './save.js';
+import { createHUD } from './hud.js';
 
-const params = new URLSearchParams(location.search);
-const seed = parseInt(params.get('seed') || '7', 10);
-const shot = params.get('shot');
-const rng = mulberry32(seed);
+const STEP = 1 / 30;
+const SHOT_STEPS_PER_FRAME = 5;
+const MAX_REAL_DT = 0.05;
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-document.getElementById('app').appendChild(renderer.domElement);
+const params = new URLSearchParams(window.location.search);
+const shotMode = params.get('shot');
+const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const isShot = shotMode === 'cover' || shotMode === 'street' || shotMode === 'chase' || shotMode === 'mission';
+
+// ------------------------------------------------------------ game state
+
+const state = {
+  mode: isShot ? 'playing' : 'title',
+  time: 0,
+  money: 250,
+  wanted: 0,
+  health: 100,
+  weapon: 'fists',
+  ammoPistol: 48,
+  ammoSmg: 90,
+  objective: '',
+  missionIndex: 0,
+  relicsFound: 0,
+  shotMode: isShot ? shotMode : null,
+  seed,
+  muted: false,
+};
+
+const input = {
+  keys: new Set(),
+  pressed: new Set(),
+  lookX: 0,
+  lookY: 0,
+  firing: false,
+  wheel: 0,
+};
+
+// ------------------------------------------------------------ renderer
+
+const mount = document.getElementById('gameMount');
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+mount.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xf7d9a0);
-scene.fog = new THREE.Fog(0xf0c489, 90, 430);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 3000);
 
-const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.1, 900);
-camera.position.set(90, 55, 90);
-
-const sun = new THREE.DirectionalLight(0xfff2d0, 2.4);
-sun.position.set(140, 200, 80);
-sun.castShadow = true;
-sun.shadow.mapSize.set(shot ? 1024 : 2048, shot ? 1024 : 2048);
-sun.shadow.camera.left = -160; sun.shadow.camera.right = 160;
-sun.shadow.camera.top = 160; sun.shadow.camera.bottom = -160;
-sun.shadow.camera.near = 10; sun.shadow.camera.far = 600;
-sun.shadow.bias = -0.0005;
-scene.add(sun);
-scene.add(new THREE.HemisphereLight(0xffe6b8, 0x8a5a30, 0.85));
-
-const world = createWorld(scene, rng);
-const player = createPlayer(scene, world, world.spawn);
-const traffic = createTraffic(scene, world, rng);
-const police = createPolice(scene, world, rng);
-const missions = createMissions(world);
-const combat = createCombat(scene);
-const hud = createHUD();
-const audio = createAudio();
-
-const G = {
-  scene, camera, renderer, world, player, traffic, police, missions, combat, hud, audio,
-  vehicles: [], input: { keys: new Set(), pressed: new Set(), mouseDown: false, mouseClicked: false, wheel: 0, aim: { x: 0, z: 0 } },
-  state: shot ? 'playing' : 'title', time: 0, money: 0, shot, camYaw: 0, lastShot: null,
-  objective: 'Free roam — find a mission marker', justCompletedMission: false,
-  autoDrive: 0, lastMenu: 'title', downState: null, musicOn: true,
-};
-window.__game = G;
-
-// Parked cars along the roads.
-for (let i = 0; i < 8; i++) {
-  const r = world.roads[Math.floor(rng() * world.roads.length)];
-  const t = rng(), x = r.x1 + (r.x2 - r.x1) * t, z = r.z1 + (r.z2 - r.z1) * t;
-  const a = Math.atan2(r.z2 - r.z1, r.x2 - r.x1) + (rng() < 0.5 ? 0 : Math.PI);
-  const v = makeVehicle(VEHICLE_TYPES[Math.floor(rng() * VEHICLE_TYPES.length)].id,
-    x - Math.sin(a) * 4, z + Math.cos(a) * 4, a);
-  scene.add(v.mesh);
-  G.vehicles.push(v);
-}
-for (const c of traffic.cars) G.vehicles.push(c);
-
-// Input.
-const mouseNDC = new THREE.Vector2(0, 0);
-addEventListener('keydown', (e) => {
-  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
-  if (!e.repeat) G.input.pressed.add(e.code);
-  G.input.keys.add(e.code);
-  if (e.code === 'Escape') {
-    if (G.state === 'playing') { G.state = 'paused'; hud.showMenu('pause'); }
-    else if (G.state === 'paused') { G.state = 'playing'; hud.hideAllMenus(); }
-  }
-  if (e.code === 'KeyM' && !e.repeat) { G.musicOn = !G.musicOn; audio.setMusic(G.musicOn); }
-});
-addEventListener('keyup', (e) => G.input.keys.delete(e.code));
-addEventListener('mousemove', (e) => {
-  mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
-});
-addEventListener('mousedown', (e) => { if (e.button === 0) { G.input.mouseDown = true; G.input.mouseClicked = true; } });
-addEventListener('mouseup', (e) => { if (e.button === 0) G.input.mouseDown = false; });
-addEventListener('wheel', (e) => { G.input.wheel += e.deltaY; }, { passive: true });
-addEventListener('contextmenu', (e) => e.preventDefault());
-addEventListener('resize', () => {
-  camera.aspect = innerWidth / innerHeight;
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
+  renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-const raycaster = new THREE.Raycaster();
-const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-const aimPoint = new THREE.Vector3();
-function updateAim() {
-  raycaster.setFromCamera(mouseNDC, camera);
-  if (raycaster.ray.intersectPlane(groundPlane, aimPoint)) {
-    G.input.aim.x = aimPoint.x; G.input.aim.z = aimPoint.z;
+// ------------------------------------------------------------ input
+
+const GAME_KEYS = new Set(['Space', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyE', 'KeyR', 'KeyM', 'Digit1', 'Digit2', 'Digit3', 'Escape', 'ShiftLeft', 'ShiftRight']);
+
+window.addEventListener('keydown', (e) => {
+  if (GAME_KEYS.has(e.code)) e.preventDefault();
+  if (!e.repeat) input.pressed.add(e.code);
+  input.keys.add(e.code);
+  if (e.code === 'Escape' && !e.repeat) {
+    if (state.mode === 'playing') state.mode = 'paused';
+    else if (state.mode === 'paused') state.mode = 'playing';
+    else if (state.mode === 'help') state.mode = 'title';
   }
+  if (e.code === 'KeyM' && !e.repeat && ctx.audio) ctx.audio.toggleMusic();
+  // The M key toggles music itself, so it must not also trigger the
+  // first-gesture music start below (which would undo the toggle).
+  wakeAudio(e.code !== 'KeyM');
+});
+window.addEventListener('keyup', (e) => input.keys.delete(e.code));
+window.addEventListener('blur', () => input.keys.clear());
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button === 0) input.firing = true;
+  wakeAudio(true);
+});
+window.addEventListener('mouseup', (e) => {
+  if (e.button === 0) input.firing = false;
+});
+window.addEventListener('mousemove', (e) => {
+  input.lookX += e.movementX || 0;
+  input.lookY += e.movementY || 0;
+});
+window.addEventListener('wheel', (e) => {
+  input.wheel += e.deltaY > 0 ? 1 : -1;
+}, { passive: true });
+renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state.mode === 'playing') state.mode = 'paused';
+});
+
+// The wasted and busted screens restart the run with a fresh page load.
+for (const id of ['btnRestartWasted', 'btnRestartBusted']) {
+  const btn = document.getElementById(id);
+  if (btn) btn.addEventListener('click', () => window.location.reload());
 }
 
-// Camera.
-const camPos = new THREE.Vector3(90, 55, 90);
-const camTarget = new THREE.Vector3();
-const desired = new THREE.Vector3();
-function updateCamera(dt) {
-  const P = player;
-  const tx = P.onFoot ? P.x : P.vehicle.x, tz = P.onFoot ? P.z : P.vehicle.z;
-  const a = P.onFoot ? P.angle : P.vehicle.angle;
-  const front = shot === 'chase';
-  const dist = front ? -13 : (P.onFoot ? 6.5 : 9);
-  const height = P.onFoot ? 3 : 3.6;
-  const side = front ? 7 : 0;
-  desired.set(
-    tx - Math.cos(a) * dist - Math.sin(a) * side,
-    height,
-    tz - Math.sin(a) * dist + Math.cos(a) * side,
-  );
-  camPos.lerp(desired, 1 - Math.exp(-4 * dt));
-  camera.position.copy(camPos);
-  // Chase cam looks back past the car so its pursuers stay in frame.
-  const look = front ? -4 : 6;
-  camTarget.set(tx + Math.cos(a) * look, 1.6, tz + Math.sin(a) * look);
-  camera.lookAt(camTarget);
-  G.camYaw = Math.atan2(camTarget.z - camera.position.z, camTarget.x - camera.position.x);
-}
+// ------------------------------------------------------------ modules
 
-// Shot-mode staging.
-function putPlayerInCar(typeId, x, z, angle, color) {
-  const v = makeVehicle(typeId, x, z, angle, color);
-  scene.add(v.mesh);
-  G.vehicles.push(v);
-  player.vehicle = v; v.driver = 'player';
-  player.onFoot = false; player.mesh.visible = false;
-  player.x = x; player.z = z; player.angle = angle;
-  return v;
-}
-if (shot) {
-  hud.hideAllMenus();
-  if (shot === 'cover') {
-    putPlayerInCar('muscle', 0, 110, -Math.PI / 2, 0xc23b22);
-    G.autoDrive = 1;
-    G.objective = 'Free roam — find a mission marker';
-  } else if (shot === 'street') {
-    player.x = 0; player.z = 40; player.angle = -Math.PI / 2;
-  } else if (shot === 'chase') {
-    putPlayerInCar('sedan', -20, -140, 0, 0x2e6fc2);
-    G.autoDrive = 1;
-    police.addWanted(3);
-    G.objective = 'Lose the heat!';
-  } else if (shot === 'mission') {
-    player.x = 165; player.z = -138; player.angle = Math.PI;
-    missions.start(0, G);
-  }
-}
-
-// Menu actions.
-function respawn() {
-  const fee = G.downState === 'busted' ? 150 : 100;
-  G.money = Math.max(0, G.money - fee);
-  if (player.vehicle) { player.vehicle.driver = null; player.vehicle = null; }
-  player.onFoot = true; player.mesh.visible = true;
-  player.health = 100;
-  police.clearWanted();
-  if (G.downState === 'busted') { player.x = 40; player.z = -20; }
-  else { player.x = 20; player.z = 60; }
-  player.angle = -Math.PI / 2;
-  G.state = 'playing';
-  hud.hideAllMenus();
-  hud.flash(G.downState === 'busted' ? 'Bail paid. -$' + fee : 'Patched up. -$' + fee);
-}
-function applySave(data) {
-  if (!data) { hud.flash('No save found yet'); return false; }
-  G.money = data.money || 0;
-  player.health = data.health ?? 100;
-  player.x = data.px ?? world.spawn.x; player.z = data.pz ?? world.spawn.z;
-  player.angle = data.angle ?? world.spawn.angle;
-  if (player.vehicle) { player.vehicle.driver = null; player.vehicle = null; }
-  player.onFoot = true; player.mesh.visible = true;
-  missions.done = Array.isArray(data.missionsDone) ? data.missionsDone.slice() : [];
-  missions.relics.found = new Set(data.relicsFound || []);
-  police.clearWanted();
-  G.state = 'playing';
-  hud.hideAllMenus();
-  hud.flash('Save loaded');
-  return true;
-}
-hud.onAction = (action) => {
-  audio.uiClick();
-  if (action === 'start') {
-    audio.init(); audio.setMusic(true);
-    G.state = 'playing'; hud.hideAllMenus();
-  } else if (action === 'load') {
-    if (hasSave()) { audio.init(); audio.setMusic(true); applySave(loadGame()); }
-    else hud.flash('No save found yet');
-  } else if (action === 'resume') {
-    G.state = 'playing'; hud.hideAllMenus();
-  } else if (action === 'save') {
-    saveGame(G); hud.flash('Game saved');
-  } else if (action === 'restart' || action === 'quit') {
-    location.reload();
-  } else if (action === 'help') {
-    G.lastMenu = G.state === 'paused' ? 'pause' : 'title';
-    hud.showMenu('help');
-  } else if (action === 'help-back') {
-    hud.showMenu(G.lastMenu);
-  } else if (action === 'retry') {
-    respawn();
-  }
+const rng = new Rng(seed);
+const ctx = {
+  scene,
+  camera,
+  input,
+  state,
+  rng,
+  camHeading: 0,
+  world: null,
+  vehicles: null,
+  traffic: null,
+  player: null,
+  combat: null,
+  police: null,
+  missions: null,
+  hud: null,
+  audio: null,
+  save: null,
 };
-if (!shot) hud.showMenu('title');
 
-// Main loop.
-const clock = new THREE.Clock();
-let prevState = G.state;
-let frames = 0;
-function tick() {
-  requestAnimationFrame(tick);
-  const rawDt = clock.getDelta();
-  // In shot mode the renderer is slow (software GL), so the game advances on
-  // a fixed step per frame: the shot staging is about game time, not wall time.
-  const dt = shot ? 1 / 30 : Math.min(rawDt, 0.05);
-  G.time += dt;
-  updateAim();
-  if (G.state === 'playing') {
-    world.update(dt, G.time);
-    traffic.update(dt, G);
-    let inp = G.input;
-    if (G.autoDrive) inp = { ...G.input, keys: new Set(G.input.keys).add('KeyW') };
-    updatePlayer(player, inp, dt, G);
-    updateCombat(combat, G.input, dt, G);
-    police.update(dt, G);
-    missions.update(dt, G);
-    updateCamera(dt);
-    hud.update(G);
-    if (G.justCompletedMission) { G.justCompletedMission = false; saveGame(G); }
-  } else if (G.state === 'title') {
-    world.update(dt, G.time);
-    traffic.update(dt, G);
-    const t = G.time * 0.05;
-    camera.position.set(Math.cos(t) * 95, 55, Math.sin(t) * 95);
-    camera.lookAt(0, 10, 0);
-  } else if (G.state === 'wasted' || G.state === 'busted') {
-    world.update(dt, G.time);
-    updateCamera(dt);
+ctx.world = createWorld(ctx);
+ctx.vehicles = createVehicles(ctx);
+ctx.traffic = createTraffic(ctx);
+ctx.player = createPlayer(ctx);
+ctx.combat = createCombat(ctx);
+ctx.police = createPolice(ctx);
+ctx.missions = createMissions(ctx);
+ctx.audio = createAudio(ctx);
+ctx.save = createSave(ctx);
+ctx.hud = createHUD(ctx);
+
+let musicStarted = false;
+function wakeAudio(allowMusicStart) {
+  if (!ctx.audio) return;
+  ctx.audio.resume();
+  // Only count the music as started when it really started: while the
+  // context is still suspended the start is a no-op and the next gesture
+  // must retry it.
+  if (!musicStarted && allowMusicStart && state.mode === 'playing') {
+    musicStarted = ctx.audio.toggleMusic();
   }
-  if (G.state !== prevState) {
-    if (G.state === 'wasted' || G.state === 'busted') {
-      G.downState = G.state;
-      hud.showMenu(G.state);
-    }
-    prevState = G.state;
-  }
-  renderer.render(scene, camera);
-  if (++frames === 30) window.__shotReady = true;
-  G.input.pressed.clear();
-  G.input.mouseClicked = false;
-  G.input.wheel = 0;
 }
-tick();
+
+// A few parked cars near the start so Rae can grab a ride at once.
+(function parkCars() {
+  const spots = ctx.world.intersections;
+  for (let i = 0; i < 6 && spots.length > 0; i++) {
+    const at = spots[Math.floor(rng.next() * spots.length)];
+    ctx.vehicles.spawn('random', at.x + rng.range(-14, 14), at.z + rng.range(-14, 14), rng.range(0, Math.PI * 2));
+  }
+})();
+
+ctx.player.place(ctx.world.places.playerStart.x, ctx.world.places.playerStart.z, 0);
+
+// The state the screenshot tool and any debugger read. Getters keep it live.
+window.__game = {
+  get state() { return state.mode; },
+  get time() { return state.time; },
+  get money() { return state.money; },
+  get objective() { return state.objective; },
+  get police() { return ctx.police; },
+  get vehicles() { return ctx.vehicles ? ctx.vehicles.all : []; },
+  get traffic() { return ctx.traffic; },
+};
+
+// ------------------------------------------------------------ camera
+
+let camYaw = Math.PI * 0.25;
+let camPitch = 0.32;
+let camPos = new THREE.Vector3(0, 40, 120);
+let lastMouseMove = -10;
+const camTarget = new THREE.Vector3();
+
+function focusPoint(out) {
+  const p = ctx.player;
+  if (p && !p.onFoot && p.car) {
+    out.copy(p.car.group.position);
+    out.y += 2.2;
+  } else if (p) {
+    out.copy(p.group.position);
+    out.y += 1.8;
+  } else {
+    out.set(0, 2, 0);
+  }
+  return out;
+}
+
+function updateCamera(dt) {
+  if (input.lookX !== 0 || input.lookY !== 0) lastMouseMove = state.time;
+  camYaw -= input.lookX * 0.0028;
+  camPitch = clamp(camPitch + input.lookY * 0.0022, 0.08, 0.9);
+  ctx.camHeading = camYaw;
+
+  const driving = ctx.player && !ctx.player.onFoot && ctx.player.car;
+  if (driving && state.time - lastMouseMove > 2.5) {
+    // Hands off the mouse while driving: ease the camera in behind the car.
+    camYaw = angleLerp(camYaw, ctx.player.car.heading, 1 - Math.exp(-0.8 * dt));
+  }
+  const dist = driving ? 12.5 : 9.5;
+  const height = driving ? 4.6 : 3.8;
+  focusPoint(camTarget);
+  const want = new THREE.Vector3(
+    camTarget.x - Math.sin(camYaw) * Math.cos(camPitch) * dist,
+    camTarget.y + Math.sin(camPitch) * dist + height * 0.4,
+    camTarget.z - Math.cos(camYaw) * Math.cos(camPitch) * dist,
+  );
+  camPos.x = damp(camPos.x, want.x, 6, dt);
+  camPos.y = damp(camPos.y, want.y, 6, dt);
+  camPos.z = damp(camPos.z, want.z, 6, dt);
+  camera.position.copy(camPos);
+  camera.lookAt(camTarget);
+}
+
+// ------------------------------------------------------------ shot staging
+
+let fixedCam = null;
+
+function stageShot() {
+  const places = ctx.world.places;
+  if (shotMode === 'cover') {
+    // High over downtown, looking across the whole city.
+    fixedCam = {
+      pos: new THREE.Vector3(places.downtown.x + 70, 120, places.downtown.z + 150),
+      look: new THREE.Vector3(places.downtown.x, 8, places.downtown.z),
+    };
+    ctx.player.place(places.downtown.x, places.downtown.z, 0);
+  } else if (shotMode === 'street') {
+    // Street level at a downtown intersection, traffic rolling past.
+    let best = ctx.world.intersections[0];
+    let bestD = Infinity;
+    for (const cross of ctx.world.intersections) {
+      const d = (cross.x - places.downtown.x) ** 2 + (cross.z - places.downtown.z) ** 2;
+      if (d < bestD) { bestD = d; best = cross; }
+    }
+    fixedCam = {
+      pos: new THREE.Vector3(best.x + 14, 3.6, best.z + 14),
+      look: new THREE.Vector3(best.x - 10, 2, best.z - 10),
+    };
+    ctx.player.place(best.x + 3, best.z + 2, Math.PI * 0.75);
+  } else if (shotMode === 'chase') {
+    // Rae in a muscle car with the law on her tail. The throttle stays
+    // down for the whole shot: in shot mode no real keyboard ever clears
+    // it, so the car genuinely drives and the patrol cars genuinely chase.
+    const road = ctx.world.roads[0];
+    const x = (road.ax + road.bx) / 2;
+    const z = (road.az + road.bz) / 2;
+    ctx.vehicles.spawn('muscle', x, z, 0);
+    ctx.player.place(x + 3, z, 0);
+    input.pressed.add('KeyE');
+    input.keys.add('KeyW');
+    ctx.police.addHeat(3);
+  } else if (shotMode === 'mission') {
+    // At the diner, Mama Rosa's job marker glowing ahead. Close enough
+    // that the job could start (inside the nine-unit start radius).
+    ctx.player.place(places.diner.x + 5, places.diner.z + 4, 0);
+    camYaw = Math.atan2(places.diner.x - (places.diner.x + 5), places.diner.z - (places.diner.z + 4));
+  }
+}
+
+// ------------------------------------------------------------ loop
+
+function stepWorld(dt) {
+  ctx.world.update(dt);
+  ctx.vehicles.update(dt);
+  ctx.traffic.update(dt);
+  if (state.mode !== 'playing') return;
+  ctx.missions.update(dt);
+  ctx.player.update(dt);
+  ctx.combat.update(dt);
+  ctx.police.update(dt);
+  if (ctx.audio) {
+    const driving = ctx.player && !ctx.player.onFoot && ctx.player.car;
+    const frac = driving ? clamp(Math.abs(ctx.player.car.speed) / ctx.player.car.type.topSpeed, 0, 1) : 0;
+    ctx.audio.setEngine(frac);
+  }
+  ctx.save.update(dt);
+  state.time += dt;
+}
+
+// Chase shot: the camera rides ahead of the car and looks back at it, so
+// the car drives toward the lens with the pursuit trailing behind it.
+function updateChaseCamera(dt) {
+  const p = ctx.player;
+  if (!p || !p.car) {
+    updateCamera(dt);
+    return;
+  }
+  const car = p.car;
+  const heading = car.heading;
+  const fx = Math.sin(heading);
+  const fz = Math.cos(heading);
+  const rx = -Math.cos(heading);
+  const rz = Math.sin(heading);
+  const at = car.group.position;
+  const want = new THREE.Vector3(
+    at.x + fx * 20 + rx * 7,
+    4.6,
+    at.z + fz * 20 + rz * 7,
+  );
+  camPos.x = damp(camPos.x, want.x, 5, dt);
+  camPos.y = damp(camPos.y, want.y, 5, dt);
+  camPos.z = damp(camPos.z, want.z, 5, dt);
+  camera.position.copy(camPos);
+  camera.lookAt(at.x, 1.6, at.z);
+  ctx.camHeading = heading;
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dtReal = Math.min((now - (frame.last ?? now)) / 1000, MAX_REAL_DT);
+  frame.last = now;
+
+  if (isShot) {
+    for (let i = 0; i < SHOT_STEPS_PER_FRAME; i++) {
+      stepWorld(STEP);
+      // A key pressed this frame acts on the first step only, never five times.
+      if (i === 0) input.pressed.clear();
+    }
+  } else if (state.mode === 'playing') {
+    stepWorld(dtReal);
+  } else if (state.mode === 'title' || state.mode === 'wasted' || state.mode === 'busted') {
+    ctx.world.update(dtReal);
+    ctx.vehicles.update(dtReal);
+    ctx.traffic.update(dtReal);
+  }
+
+  if (fixedCam) {
+    camera.position.copy(fixedCam.pos);
+    camera.lookAt(fixedCam.look);
+    ctx.camHeading = camYaw;
+  } else if (state.mode === 'title' && !isShot) {
+    // Slow orbit over downtown behind the title menu.
+    const t = now / 1000;
+    const c = ctx.world.places.downtown;
+    camera.position.set(c.x + Math.sin(t * 0.05) * 130, 85, c.z + Math.cos(t * 0.05) * 130);
+    camera.lookAt(c.x, 5, c.z);
+  } else if (isShot && shotMode === 'chase') {
+    updateChaseCamera(isShot ? STEP * SHOT_STEPS_PER_FRAME : dtReal);
+  } else {
+    updateCamera(isShot ? STEP * SHOT_STEPS_PER_FRAME : dtReal);
+  }
+
+  ctx.hud.update(isShot ? STEP * SHOT_STEPS_PER_FRAME : dtReal);
+  renderer.render(scene, camera);
+
+  input.pressed.clear();
+  input.lookX = 0;
+  input.lookY = 0;
+  input.wheel = 0;
+
+  frame.painted = (frame.painted ?? 0) + 1;
+  // Ready means painted: the page is fit to screenshot in any mode, shot
+  // or title, once two frames have rendered.
+  if (frame.painted >= 2 && !window.__shotReady) window.__shotReady = true;
+}
+
+if (isShot) stageShot();
+requestAnimationFrame(frame);

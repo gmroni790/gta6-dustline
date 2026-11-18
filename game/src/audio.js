@@ -1,226 +1,303 @@
-// All sound in Dustline is synthesized with WebAudio — no audio files.
-// Every method is a safe no-op until init() runs on a user gesture,
-// so calling sounds before the context exists never throws.
+// Dustline audio: every sound is synthesized with the Web Audio API.
+// No audio files, no network. Every method is safe to call before the
+// audio context exists, while it is suspended, or when the browser blocks
+// audio outright — it simply does nothing, and never throws or logs.
+// The screenshot tool runs with no user gesture, so silence there is
+// correct behavior.
 
-export function createAudio() {
-  let ctx = null;        // AudioContext, created on first user gesture
-  let master = null;     // master gain feeding the destination
-  let noiseBuffer = null; // 1s of white noise, reused by every noise burst
-  let engineNodes = null; // persistent engine oscillators + gain
-  let sirenNodes = null;  // persistent siren oscillator + gain
-  let musicTimer = null;  // interval id for the bass loop
-  let musicStep = 0;      // current step of the bass pattern
+import { clamp } from './utils.js';
 
-  // One-shot oscillator tone that fades out over `dur` seconds.
-  function playTone(freq, dur, type, gain, when) {
-    if (!ctx) return;
-    const start = when ?? ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
-    osc.type = type || 'sine';
-    osc.frequency.setValueAtTime(freq, start);
-    amp.gain.setValueAtTime(gain || 0.15, start);
-    amp.gain.exponentialRampToValueAtTime(0.001, start + dur);
-    osc.connect(amp);
-    amp.connect(master);
-    osc.start(start);
-    osc.stop(start + dur + 0.02);
+// A slow desert loop: plucked triangle notes in A minor, one per step,
+// with 0 steps as rests. Values are MIDI note numbers.
+const MUSIC_PATTERN = [57, 0, 60, 64, 0, 67, 64, 60, 57, 0, 55, 57, 0, 60, 0, 0];
+const MUSIC_STEP = 0.42; // seconds per pattern step
+const DRONE_FREQ = 55; // A1, the low desert drone
+const ENGINE_TOP_SPEED = 42; // units/s treated as full throttle
+
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+export function createAudio(ctx) {
+  const state = ctx.state;
+  let actx = null;
+  let master = null;
+  let muted = !!(state && state.muted);
+  let musicOn = false;
+  let noiseBuf = null;
+
+  // Engine hum: one sawtooth through a low-pass filter.
+  let engineOsc = null;
+  let engineFilter = null;
+  let engineGain = null;
+
+  // Police wail: a triangle wave wobbled by a slow LFO.
+  let sirenOsc = null;
+  let sirenLfo = null;
+  let sirenGain = null;
+
+  // Music loop: a low drone plus a scheduled pluck pattern.
+  let droneOsc = null;
+  let droneGain = null;
+  let musicTimer = null;
+  let nextNoteTime = 0;
+  let stepIndex = 0;
+
+  // True only when sound can actually be heard.
+  function ready() {
+    return !!(actx && master && actx.state === 'running');
   }
 
-  // One-shot filtered noise burst that fades out over `dur` seconds.
-  function playNoise(dur, filterFreq, gain, filterType) {
-    if (!ctx) return;
-    const start = ctx.currentTime;
-    const src = ctx.createBufferSource();
-    const amp = ctx.createGain();
-    const filter = ctx.createBiquadFilter();
-    src.buffer = noiseBuffer;
-    src.loop = true;
-    filter.type = filterType || 'bandpass';
-    filter.frequency.value = filterFreq || 1000;
-    amp.gain.setValueAtTime(gain || 0.2, start);
-    amp.gain.exponentialRampToValueAtTime(0.001, start + dur);
-    src.connect(filter);
-    filter.connect(amp);
-    amp.connect(master);
-    src.start(start);
-    src.stop(start + dur + 0.02);
+  // Create the context on first call, resume it when suspended. Safe to
+  // call any time; does nothing when audio is already running.
+  function resume() {
+    try {
+      if (!actx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        actx = new AC();
+        master = actx.createGain();
+        master.gain.value = muted ? 0 : 0.9;
+        master.connect(actx.destination);
+      }
+      if (actx.state === 'suspended') {
+        const p = actx.resume();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      }
+    } catch (e) {
+      actx = null;
+      master = null;
+    }
   }
 
-  // One-shot tone sliding from freqA down/up to freqB over `dur` seconds.
-  function playSlide(freqA, freqB, dur, type, gain) {
-    if (!ctx) return;
-    const start = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
-    osc.type = type || 'sine';
-    osc.frequency.setValueAtTime(freqA, start);
-    osc.frequency.exponentialRampToValueAtTime(freqB, start + dur);
-    amp.gain.setValueAtTime(gain || 0.15, start);
-    amp.gain.exponentialRampToValueAtTime(0.001, start + dur);
-    osc.connect(amp);
-    amp.connect(master);
-    osc.start(start);
-    osc.stop(start + dur + 0.02);
+  // One short synthesized note with a quick attack and an exponential tail.
+  function tone(freq, at, dur, type, vol) {
+    if (!ready()) return;
+    try {
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      osc.type = type || 'triangle';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, at);
+      gain.gain.linearRampToValueAtTime(vol, at + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, at + dur);
+      osc.connect(gain);
+      gain.connect(master);
+      osc.start(at);
+      osc.stop(at + dur + 0.05);
+    } catch (e) { /* silence on failure */ }
   }
 
-  const audio = {
-    // Call from a user gesture (button click / key press). Creates the
-    // context on first call, resumes it when the browser suspended it.
-    init() {
-      if (ctx) {
-        if (ctx.state === 'suspended') ctx.resume();
+  function getNoise() {
+    if (noiseBuf) return noiseBuf;
+    try {
+      const len = Math.floor(actx.sampleRate * 0.3);
+      noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i += 1) data[i] = Math.random() * 2 - 1;
+    } catch (e) {
+      noiseBuf = null;
+    }
+    return noiseBuf;
+  }
+
+  // Engine hum: pitch and volume follow the speed fraction (0 to 1).
+  function setEngine(frac) {
+    if (!ready()) return;
+    try {
+      if (!engineOsc) {
+        engineOsc = actx.createOscillator();
+        engineOsc.type = 'sawtooth';
+        engineOsc.frequency.value = 45;
+        engineFilter = actx.createBiquadFilter();
+        engineFilter.type = 'lowpass';
+        engineFilter.frequency.value = 250;
+        engineGain = actx.createGain();
+        engineGain.gain.value = 0;
+        engineOsc.connect(engineFilter);
+        engineFilter.connect(engineGain);
+        engineGain.connect(master);
+        engineOsc.start();
+      }
+      const f = clamp(frac || 0, 0, 1);
+      const t = actx.currentTime;
+      engineOsc.frequency.setTargetAtTime(45 + f * 140, t, 0.08);
+      engineFilter.frequency.setTargetAtTime(250 + f * 900, t, 0.08);
+      engineGain.gain.setTargetAtTime(f <= 0.01 ? 0 : 0.025 + f * 0.06, t, 0.08);
+    } catch (e) { /* silence on failure */ }
+  }
+
+  // Two-tone police wail, on or off.
+  function siren(on) {
+    if (on) {
+      if (!ready() || sirenOsc) return;
+      try {
+        sirenOsc = actx.createOscillator();
+        sirenOsc.type = 'triangle';
+        sirenOsc.frequency.value = 750;
+        sirenLfo = actx.createOscillator();
+        sirenLfo.type = 'sine';
+        sirenLfo.frequency.value = 0.7;
+        const lfoGain = actx.createGain();
+        lfoGain.gain.value = 220;
+        sirenGain = actx.createGain();
+        sirenGain.gain.value = 0.045;
+        sirenLfo.connect(lfoGain);
+        lfoGain.connect(sirenOsc.frequency);
+        sirenOsc.connect(sirenGain);
+        sirenGain.connect(master);
+        sirenOsc.start();
+        sirenLfo.start();
+      } catch (e) {
+        sirenOsc = null;
+        sirenLfo = null;
+        sirenGain = null;
+      }
+    } else {
+      if (!sirenOsc) return;
+      try {
+        sirenOsc.stop();
+        sirenLfo.stop();
+      } catch (e) { /* already stopped */ }
+      try {
+        sirenOsc.disconnect();
+        sirenLfo.disconnect();
+        sirenGain.disconnect();
+      } catch (e) { /* already disconnected */ }
+      sirenOsc = null;
+      sirenLfo = null;
+      sirenGain = null;
+    }
+  }
+
+  // A short noise burst; pitch differs per weapon, fists get a soft thud.
+  function shot(weapon) {
+    if (!ready()) return;
+    try {
+      if (weapon === 'fists') {
+        tone(90, actx.currentTime, 0.1, 'sine', 0.2);
         return;
       }
-      ctx = new (window.AudioContext || window.webkitAudioContext)();
-      master = ctx.createGain();
-      master.gain.value = 0.5;
-      master.connect(ctx.destination);
-      noiseBuffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
-      const samples = noiseBuffer.getChannelData(0);
-      for (let i = 0; i < samples.length; i++) samples[i] = Math.random() * 2 - 1;
-    },
+      const buf = getNoise();
+      if (!buf) return;
+      const isSmg = weapon === 'smg';
+      const src = actx.createBufferSource();
+      src.buffer = buf;
+      const filter = actx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.value = isSmg ? 900 : 1400;
+      filter.Q.value = 0.8;
+      const gain = actx.createGain();
+      const t = actx.currentTime;
+      const dur = isSmg ? 0.09 : 0.14;
+      gain.gain.setValueAtTime(isSmg ? 0.22 : 0.3, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      src.connect(filter);
+      filter.connect(gain);
+      gain.connect(master);
+      src.start(t);
+      src.stop(t + dur + 0.02);
+    } catch (e) { /* silence on failure */ }
+  }
 
-    // Continuous engine drone. Two detuned oscillators through a lowpass;
-    // pitch and loudness follow speed (v01 in [0,1]). Silent off the road.
-    engine(v01, driving) {
-      if (!ctx) return;
-      if (!engineNodes) {
-        const oscA = ctx.createOscillator();
-        const oscB = ctx.createOscillator();
-        const filter = ctx.createBiquadFilter();
-        const amp = ctx.createGain();
-        oscA.type = 'sawtooth';
-        oscA.frequency.value = 55;
-        oscB.type = 'square';
-        oscB.frequency.value = 110;
-        filter.type = 'lowpass';
-        filter.frequency.value = 400;
-        amp.gain.value = 0;
-        oscA.connect(filter);
-        oscB.connect(filter);
-        filter.connect(amp);
-        amp.connect(master);
-        oscA.start();
-        oscB.start();
-        engineNodes = { oscA, oscB, amp };
+  // A short pleasant two-note sound for pickups.
+  function chime() {
+    if (!ready()) return;
+    const t = actx.currentTime;
+    tone(659.25, t, 0.4, 'triangle', 0.16); // E5
+    tone(880, t + 0.09, 0.5, 'triangle', 0.16); // A5
+  }
+
+  // A short mission-complete arpeggio.
+  function jingle() {
+    if (!ready()) return;
+    const t = actx.currentTime;
+    const notes = [440, 523.25, 659.25, 880]; // A4 C5 E5 A5
+    notes.forEach((f, i) => tone(f, t + i * 0.11, 0.5, 'triangle', 0.16));
+  }
+
+  // Schedule pattern notes a little ahead of time so the loop has no gaps.
+  function scheduleMusic() {
+    if (!ready()) return;
+    try {
+      while (nextNoteTime < actx.currentTime + 0.3) {
+        const midi = MUSIC_PATTERN[stepIndex % MUSIC_PATTERN.length];
+        if (midi) tone(midiToFreq(midi), nextNoteTime, 0.4, 'triangle', 0.13);
+        nextNoteTime += MUSIC_STEP;
+        stepIndex += 1;
       }
-      const now = ctx.currentTime;
-      const base = 50 + v01 * 160;
-      engineNodes.oscA.frequency.setTargetAtTime(base, now, 0.05);
-      engineNodes.oscB.frequency.setTargetAtTime(base * 2.01, now, 0.05);
-      engineNodes.amp.gain.setTargetAtTime(driving ? 0.10 + v01 * 0.08 : 0, now, 0.08);
-    },
+    } catch (e) { /* silence on failure */ }
+  }
 
-    // Police siren: triangle wave wobbling between 700 and 950 Hz.
-    siren(on) {
-      if (!ctx) return;
-      if (!sirenNodes) {
-        const osc = ctx.createOscillator();
-        const amp = ctx.createGain();
-        const lfo = ctx.createOscillator();
-        const lfoGain = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.value = 825;
-        lfo.type = 'square';
-        lfo.frequency.value = 1.2;
-        lfoGain.gain.value = 125;
-        lfo.connect(lfoGain);
-        lfoGain.connect(osc.frequency);
-        amp.gain.value = 0;
-        osc.connect(amp);
-        amp.connect(master);
-        osc.start();
-        lfo.start();
-        sirenNodes = { amp };
-      }
-      sirenNodes.amp.gain.setTargetAtTime(on ? 0.06 : 0, ctx.currentTime, 0.1);
-    },
+  function startMusic() {
+    if (!ready()) return;
+    try {
+      droneOsc = actx.createOscillator();
+      droneOsc.type = 'sine';
+      droneOsc.frequency.value = DRONE_FREQ;
+      droneGain = actx.createGain();
+      droneGain.gain.value = 0.05;
+      droneOsc.connect(droneGain);
+      droneGain.connect(master);
+      droneOsc.start();
+      nextNoteTime = actx.currentTime + 0.1;
+      stepIndex = 0;
+      musicTimer = setInterval(scheduleMusic, 120);
+      musicOn = true;
+    } catch (e) {
+      // A half-started loop must not leave a drone humming behind.
+      stopMusic();
+    }
+  }
 
-    // Two-note car horn.
-    honk() {
-      if (!ctx) return;
-      const now = ctx.currentTime;
-      for (const freq of [370, 440]) playTone(freq, 0.35, 'square', 0.08, now);
-    },
+  function stopMusic() {
+    if (musicTimer !== null) {
+      clearInterval(musicTimer);
+      musicTimer = null;
+    }
+    try {
+      if (droneOsc) droneOsc.stop();
+    } catch (e) { /* already stopped */ }
+    try {
+      if (droneOsc) droneOsc.disconnect();
+      if (droneGain) droneGain.disconnect();
+    } catch (e) { /* already disconnected */ }
+    droneOsc = null;
+    droneGain = null;
+    musicOn = false;
+  }
 
-    // Gunshot: a noise crack plus a low thump. SMG is shorter and higher.
-    gunshot(kind) {
-      if (!ctx) return;
-      const isSmg = kind === 'smg';
-      playNoise(isSmg ? 0.07 : 0.12, isSmg ? 1800 : 900, 0.35);
-      playTone(60, 0.1, 'sine', 0.3);
-    },
+  // Start or stop the desert music loop; returns whether music is now on.
+  function toggleMusic() {
+    if (musicOn) {
+      stopMusic();
+      return false;
+    }
+    startMusic();
+    return musicOn;
+  }
 
-    // Melee hit: a low, muffled thud.
-    punch() {
-      playNoise(0.08, 400, 0.25, 'lowpass');
-    },
+  function setMuted(m) {
+    muted = !!m;
+    if (state) state.muted = muted;
+    if (actx && master) {
+      try {
+        master.gain.setTargetAtTime(muted ? 0 : 0.9, actx.currentTime, 0.02);
+      } catch (e) { /* ignore */ }
+    }
+  }
 
-    // Pickup chime: two rising notes.
-    pickup() {
-      if (!ctx) return;
-      const now = ctx.currentTime;
-      playTone(660, 0.09, 'sine', 0.15, now);
-      playTone(880, 0.14, 'sine', 0.15, now + 0.09);
-    },
+  function update() {
+    // Keep the engine hum following the player's car, silent off the road
+    // or off the playing screen. Another module may also call setEngine
+    // directly; both calls agree, and the second one each frame is harmless.
+    const p = ctx.player;
+    if (state.mode === 'playing' && p && p.car) {
+      setEngine(clamp((p.car.speed || 0) / ENGINE_TOP_SPEED, 0, 1));
+    } else {
+      setEngine(0);
+    }
+  }
 
-    // Cash register: three rising notes.
-    cash() {
-      if (!ctx) return;
-      const now = ctx.currentTime;
-      [880, 1170, 1560].forEach((freq, i) => playTone(freq, 0.1, 'sine', 0.14, now + i * 0.08));
-    },
-
-    // Mission success: four-note ascending arpeggio.
-    missionOk() {
-      if (!ctx) return;
-      const now = ctx.currentTime;
-      [523, 659, 784, 1046].forEach((freq, i) => playTone(freq, 0.12, 'triangle', 0.16, now + i * 0.12));
-    },
-
-    // Mission failed: two descending notes.
-    missionFail() {
-      if (!ctx) return;
-      const now = ctx.currentTime;
-      playTone(392, 0.18, 'triangle', 0.16, now);
-      playTone(262, 0.3, 'triangle', 0.16, now + 0.18);
-    },
-
-    // Busted: a slow descending slide.
-    busted() {
-      playSlide(600, 300, 0.8, 'triangle', 0.16);
-    },
-
-    // Wasted: a low, gritty descending slide.
-    wasted() {
-      playSlide(220, 110, 0.9, 'sawtooth', 0.12);
-    },
-
-    // Menu click: a short high blip.
-    uiClick() {
-      playTone(1200, 0.04, 'sine', 0.08);
-    },
-
-    // Looping background groove: an 8-step bass line with a hi-hat tick
-    // on every odd step. Pass false to stop it.
-    setMusic(on) {
-      if (on) {
-        if (musicTimer || !ctx) return;
-        const bass = [55, 55, 65.41, 82.41, 55, 55, 65.41, 82.41];
-        musicTimer = setInterval(() => {
-          if (!ctx) return;
-          const s = musicStep % 8;
-          playTone(bass[s], 0.13, 'triangle', 0.12);
-          if (s % 2 === 1) playNoise(0.03, 6000, 0.05, 'highpass');
-          musicStep++;
-        }, 140);
-      } else if (musicTimer) {
-        clearInterval(musicTimer);
-        musicTimer = null;
-      }
-    },
-  };
-
-  return audio;
+  return { update, resume, setEngine, siren, shot, chime, jingle, toggleMusic, setMuted };
 }

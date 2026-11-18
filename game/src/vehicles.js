@@ -1,213 +1,272 @@
-import * as THREE from 'three';
+// Dustline — vehicles.js
+//
+// Seven desert vehicle types, each built from boxes, cylinders and
+// simple shapes in three.js. Every model faces positive z, so a
+// vehicle's rotation about y is exactly its heading.
+//
+// The factory returns the type table, a spawn function and the live
+// list of vehicles. Driving physics live on each vehicle object:
+// throttle, steering that weakens at speed, drag, and collision
+// against the world's colliders and bounds.
 
-// Seven desert rides. top is top speed in m/s, accel in m/s^2, grip is steering rate.
-export const VEHICLE_TYPES = [
-  { id: 'buggy', name: 'Dune Buggy', top: 38, accel: 16, grip: 2.2, body: 'buggy', color: 0xe8a13a },
-  { id: 'pickup', name: 'Pickup', top: 32, accel: 12, grip: 2.0, body: 'pickup', color: 0xb8542e },
-  { id: 'muscle', name: 'Muscle Car', top: 42, accel: 17, grip: 1.7, body: 'muscle', color: 0x8e2f2f },
-  { id: 'sedan', name: 'Sedan', top: 34, accel: 13, grip: 2.1, body: 'sedan', color: 0x4a6a8a },
-  { id: 'van', name: 'Van', top: 28, accel: 10, grip: 1.8, body: 'van', color: 0xd8d0b8 },
-  { id: 'hauler', name: 'Semi Hauler', top: 26, accel: 8, grip: 1.6, body: 'hauler', color: 0x3a5a3a },
-  { id: 'lowrider', name: 'Lowrider', top: 33, accel: 12, grip: 2.0, body: 'lowrider', color: 0x7a2e8e },
+import * as THREE from '../vendor/three.module.min.js';
+import { clamp } from './utils.js';
+
+// id, display name, top speed (units/s), acceleration, turn rate
+// (radians/s at low speed), length, width, paint colours.
+const TYPES = [
+  { id: 'buggy', name: 'Dune Buggy', topSpeed: 34, accel: 16, turnRate: 2.3, length: 3.6, width: 1.9, colors: [0xd8c24a, 0xc25a2e, 0x7ab648] },
+  { id: 'pickup', name: 'Pickup Truck', topSpeed: 30, accel: 12, turnRate: 1.8, length: 5.0, width: 2.0, colors: [0x8a2f28, 0x2e5a8a, 0xd8d0c0] },
+  { id: 'sedan', name: 'Sedan', topSpeed: 32, accel: 13, turnRate: 2.0, length: 4.6, width: 1.9, colors: [0x3a6ea5, 0xb8b0a0, 0x222222] },
+  { id: 'taxi', name: 'Taxi Cab', topSpeed: 32, accel: 13, turnRate: 2.0, length: 4.6, width: 1.9, colors: [0xf2c230, 0xf2c230, 0xe8b020] },
+  { id: 'van', name: 'Delivery Van', topSpeed: 26, accel: 9, turnRate: 1.5, length: 5.4, width: 2.1, colors: [0xe8e4da, 0x4a7a4a, 0x8a8a92] },
+  { id: 'muscle', name: 'Muscle Car', topSpeed: 40, accel: 18, turnRate: 1.9, length: 4.8, width: 2.0, colors: [0xa01818, 0x181818, 0x1a3a6a] },
+  { id: 'semi', name: 'Semi Hauler', topSpeed: 24, accel: 7, turnRate: 1.2, length: 12.0, width: 2.5, colors: [0x2a6a8a, 0x8a2a2a, 0xd8d8d8] },
 ];
 
-// Shared part materials.
-const TIRE_MAT = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.95 });
-const TRIM_MAT = new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.9 });
-const GLASS_MAT = new THREE.MeshStandardMaterial({ color: 0x141e28, roughness: 0.1, metalness: 0.8 });
-const CHROME_MAT = new THREE.MeshStandardMaterial({ color: 0xd8d8d8, roughness: 0.2, metalness: 0.9 });
-const HEADLIGHT_MAT = new THREE.MeshStandardMaterial({ color: 0x111111, emissive: 0xfff2b0, emissiveIntensity: 1.5 });
-const TAILLIGHT_MAT = new THREE.MeshStandardMaterial({ color: 0x111111, emissive: 0xff2222, emissiveIntensity: 1.2 });
+// Materials shared by every vehicle, so a new spawn is cheap.
+const glassMat = new THREE.MeshLambertMaterial({ color: 0x18242c });
+const tireMat = new THREE.MeshLambertMaterial({ color: 0x1a1a1a });
+const headMat = new THREE.MeshLambertMaterial({ color: 0xfff6c0, emissive: 0xfff2a0 });
+const tailMat = new THREE.MeshLambertMaterial({ color: 0x881111, emissive: 0x550000 });
+const darkMat = new THREE.MeshLambertMaterial({ color: 0x2a2a2a });
+const trailerMat = new THREE.MeshLambertMaterial({ color: 0xd8d4c8 });
 
-// [length, width, body height, body center height] per body style. Cars face local +X.
-const BODY_DIM = {
-  buggy: [3.6, 1.9, 0.5, 0.62], pickup: [4.8, 2.0, 0.7, 0.62], muscle: [4.9, 2.0, 0.62, 0.55],
-  sedan: [4.6, 1.9, 0.65, 0.58], van: [5.0, 2.1, 1.5, 0.95], hauler: [7.6, 2.3, 0.8, 0.75],
-  lowrider: [4.9, 2.0, 0.5, 0.45],
-};
-// [front wheel radius, rear wheel radius] for bodies that differ from the default 0.37.
-const WHEEL_RADIUS = { buggy: [0.36, 0.5], hauler: [0.44, 0.44], lowrider: [0.34, 0.34] };
+// Paint colours repeat across spawns, so cache one material per colour
+// instead of allocating a fresh material for every vehicle.
+const paintCache = new Map();
+function paintMat(color) {
+  let m = paintCache.get(color);
+  if (!m) {
+    m = new THREE.MeshLambertMaterial({ color });
+    paintCache.set(color, m);
+  }
+  return m;
+}
 
-export function buildCarMesh(typeId, color) {
-  const type = VEHICLE_TYPES.find((v) => v.id === typeId) || VEHICLE_TYPES[3];
-  const paint = color === undefined ? type.color : color;
+// Wheel geometry is pre-rotated so each wheel spins about the x axis.
+const carWheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 10);
+carWheelGeo.rotateZ(Math.PI / 2);
+const bigWheelGeo = new THREE.CylinderGeometry(0.5, 0.5, 0.34, 10);
+bigWheelGeo.rotateZ(Math.PI / 2);
+const unitBox = new THREE.BoxGeometry(1, 1, 1);
+
+// One small box, scaled and placed. Keeps the builders below terse.
+function box(parent, mat, w, h, d, x, y, z) {
+  const m = new THREE.Mesh(unitBox, mat);
+  m.scale.set(w, h, d);
+  m.position.set(x, y, z);
+  parent.add(m);
+  return m;
+}
+
+// Build one vehicle's mesh. Returns the group plus its spinning wheels.
+function buildVehicleMesh(type, paintColor) {
   const group = new THREE.Group();
-  const bodyMat = new THREE.MeshStandardMaterial({ color: paint, roughness: 0.35, metalness: 0.55 });
-  const [len, wid, bodyH, bodyY] = BODY_DIM[type.body];
-
-  function part(w, h, d, mat, x, y, z) {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-    mesh.position.set(x, y, z);
-    mesh.castShadow = true;
-    group.add(mesh);
-    return mesh;
-  }
-
-  let mainBody;
-  if (type.body === 'buggy') {
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(len * 0.8, 0.18, wid * 0.7, TRIM_MAT, 0, bodyY - 0.32, 0);
-    part(0.5, 0.5, 0.7, TRIM_MAT, -0.4, bodyY + 0.45, -0.45);
-    part(0.5, 0.5, 0.7, TRIM_MAT, -0.4, bodyY + 0.45, 0.45);
-    part(0.12, 1.1, 0.12, TRIM_MAT, -0.5, bodyY + 0.9, -0.7);
-    part(0.12, 1.1, 0.12, TRIM_MAT, -0.5, bodyY + 0.9, 0.7);
-    part(0.12, 0.12, 1.5, TRIM_MAT, -0.5, bodyY + 1.45, 0);
-  } else if (type.body === 'pickup') {
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(1.5, 0.8, 1.8, bodyMat, 0.8, bodyY + 0.7, 0);
-    part(0.9, 0.6, 1.7, GLASS_MAT, 0.95, bodyY + 0.7, 0);
-    part(1.9, 0.45, 0.12, bodyMat, -1.2, bodyY + 0.55, -0.9);
-    part(1.9, 0.45, 0.12, bodyMat, -1.2, bodyY + 0.55, 0.9);
-    part(0.12, 0.45, 1.9, bodyMat, -2.3, bodyY + 0.55, 0);
-  } else if (type.body === 'muscle') {
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(1.0, 0.18, 0.8, TRIM_MAT, 1.5, bodyY + bodyH / 2 + 0.08, 0);
-    part(2.0, 0.55, 1.7, GLASS_MAT, -0.4, bodyY + 0.6, 0);
-    part(2.1, 0.1, 1.75, bodyMat, -0.4, bodyY + 0.92, 0);
-    part(0.1, 0.3, 0.1, TRIM_MAT, -2.2, bodyY + 0.7, -0.7);
-    part(0.1, 0.3, 0.1, TRIM_MAT, -2.2, bodyY + 0.7, 0.7);
-    part(0.5, 0.08, 1.8, TRIM_MAT, -2.25, bodyY + 0.9, 0);
-  } else if (type.body === 'sedan') {
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(2.2, 0.55, 1.7, GLASS_MAT, -0.2, bodyY + 0.6, 0);
-    part(2.3, 0.1, 1.75, bodyMat, -0.2, bodyY + 0.92, 0);
-    part(0.9, 0.25, 1.8, bodyMat, -1.8, bodyY + 0.45, 0);
-  } else if (type.body === 'van') {
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(0.1, 0.7, 1.8, GLASS_MAT, len / 2 - 0.05, bodyY + 0.35, 0);
-    part(2.6, 0.6, 0.06, GLASS_MAT, -0.4, bodyY + 0.35, -wid / 2 - 0.01);
-    part(2.6, 0.6, 0.06, GLASS_MAT, -0.4, bodyY + 0.35, wid / 2 + 0.01);
-    part(0.06, 1.0, 0.9, TRIM_MAT, -0.4, bodyY - 0.2, wid / 2 + 0.01);
-  } else if (type.body === 'hauler') {
-    part(len, 0.5, 1.8, TRIM_MAT, 0, 0.65, 0);
-    mainBody = part(1.9, 1.9, 2.2, bodyMat, 2.7, 1.55, 0);
-    part(0.1, 0.8, 1.9, GLASS_MAT, 3.65, 1.9, 0);
-    part(1.4, 1.4, 2.2, bodyMat, 1.1, 1.3, 0);
-    part(0.3, 0.3, 2.0, CHROME_MAT, 3.6, 0.55, 0);
-    const stack = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 2.2, 8), CHROME_MAT);
-    stack.position.set(1.85, 2.2, -0.95);
-    stack.castShadow = true;
-    group.add(stack);
-    for (const side of [-1, 1]) {
-      const tank = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 1.6, 12), CHROME_MAT);
-      tank.rotation.z = Math.PI / 2;
-      tank.position.set(0.2, 0.6, side * 1.05);
-      tank.castShadow = true;
-      group.add(tank);
-    }
-  } else { // lowrider
-    mainBody = part(len, bodyH, wid, bodyMat, 0, bodyY, 0);
-    part(2.0, 0.5, 1.7, GLASS_MAT, -0.3, bodyY + 0.5, 0);
-    part(2.1, 0.1, 1.75, bodyMat, -0.3, bodyY + 0.78, 0);
-    part(0.15, 0.22, 1.9, CHROME_MAT, len / 2 + 0.05, bodyY - 0.05, 0);
-    part(0.15, 0.22, 1.9, CHROME_MAT, -len / 2 - 0.05, bodyY - 0.05, 0);
-    part(0.08, 0.3, 1.2, CHROME_MAT, len / 2 + 0.02, bodyY + 0.1, 0);
-  }
-
-  // Headlights at the front, taillights at the rear.
-  for (const side of [-1, 1]) {
-    part(0.08, 0.18, 0.4, HEADLIGHT_MAT, len / 2 + 0.01, bodyY + 0.1, side * wid * 0.32);
-    part(0.08, 0.16, 0.35, TAILLIGHT_MAT, -len / 2 - 0.01, bodyY + 0.1, side * wid * 0.32);
-  }
-
-  // Wheels: a sideways cylinder inside a pivot group. The pivot spins with
-  // speed and the front pivots yaw with steering.
-  const [frontR, rearR] = WHEEL_RADIUS[type.body] || [0.37, 0.37];
   const wheels = [];
-  const pivots = [];
-  const wheelSpots = [
-    [len * 0.32, -1, frontR], [len * 0.32, 1, frontR],
-    [-len * 0.32, -1, rearR], [-len * 0.32, 1, rearR],
-  ];
-  for (const [wx, wz, radius] of wheelSpots) {
-    const pivot = new THREE.Group();
-    const width = type.body === 'muscle' && wx < 0 ? 0.42 : type.body === 'hauler' ? 0.4 : 0.3;
-    const tire = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, width, 14), TIRE_MAT);
-    tire.rotation.x = Math.PI / 2;
-    tire.castShadow = true;
-    pivot.add(tire);
-    if (type.body === 'lowrider') {
-      const hub = new THREE.Mesh(
-        new THREE.CylinderGeometry(radius * 0.55, radius * 0.55, width + 0.04, 10), CHROME_MAT);
-      hub.rotation.x = Math.PI / 2;
-      pivot.add(hub);
-    }
-    pivot.position.set(wx, radius, wz * (wid / 2 - 0.02));
-    group.add(pivot);
-    pivots.push(pivot);
-    wheels.push(tire);
+  const paint = paintMat(paintColor);
+  const L = type.length;
+  const W = type.width;
+
+  function addWheel(geo, radius, x, z) {
+    const wheel = new THREE.Mesh(geo, tireMat);
+    wheel.position.set(x, radius, z);
+    group.add(wheel);
+    wheels.push({ mesh: wheel, radius });
   }
 
-  group.userData.wheels = wheels;
-  group.userData.pivots = pivots;
-  group.userData.body = mainBody;
-  group.userData.wheelR = frontR;
-  return group;
-}
-
-let nextVehicleId = 1;
-
-export function makeVehicle(typeId, x, z, angle, color) {
-  const type = VEHICLE_TYPES.find((v) => v.id === typeId) || VEHICLE_TYPES[3];
-  const mesh = buildCarMesh(type.id, color);
-  mesh.position.set(x, 0, z);
-  mesh.rotation.y = -angle;
-  return {
-    mesh, type, id: nextVehicleId++, x, z, angle,
-    speed: 0, steer: 0, color: color === undefined ? type.color : color,
-    driver: null, hp: 100, alive: true,
-  };
-}
-
-export function driveVehicle(V, ctl, dt, world) {
-  if (!V.alive) {
-    V.speed = 0;
-    return;
+  function addLights(y) {
+    box(group, headMat, 0.35, 0.18, 0.12, -W / 2 + 0.45, y, L / 2 + 0.02);
+    box(group, headMat, 0.35, 0.18, 0.12, W / 2 - 0.45, y, L / 2 + 0.02);
+    box(group, tailMat, 0.3, 0.15, 0.12, -W / 2 + 0.45, y, -L / 2 - 0.02);
+    box(group, tailMat, 0.3, 0.15, 0.12, W / 2 - 0.45, y, -L / 2 - 0.02);
   }
-  const type = V.type;
-  let topSpeed = type.top;
-  if (V.hp < 30) topSpeed *= 0.4 + 0.6 * (V.hp / 30);
 
-  V.speed += ctl.throttle * type.accel * dt;
-  if (ctl.brake) {
-    const decel = 30 * dt;
-    V.speed -= Math.sign(V.speed) * Math.min(Math.abs(V.speed), decel);
-  } else if (!ctl.throttle) {
-    const drag = (2 + Math.abs(V.speed) * 0.25) * dt;
-    V.speed -= Math.sign(V.speed) * Math.min(Math.abs(V.speed), drag);
-  }
-  V.speed = Math.max(-8, Math.min(topSpeed, V.speed));
-  if (Math.abs(V.speed) < 0.02 && !ctl.throttle) V.speed = 0;
-
-  V.steer = ctl.steer;
-  const speedFrac = Math.max(0.15, Math.min(1, Math.abs(V.speed) / type.top));
-  V.angle += ctl.steer * type.grip * speedFrac * dt * Math.sign(V.speed);
-
-  const nx = V.x + Math.cos(V.angle) * V.speed * dt;
-  const nz = V.z + Math.sin(V.angle) * V.speed * dt;
-  if (world && world.collides(nx, nz, 1.7)) {
-    V.speed *= -0.25; // bounce back off the obstacle
+  if (type.id === 'buggy') {
+    // Open buggy: low tub, a seat, a roll cage, big knobbly wheels.
+    box(group, paint, W, 0.5, L, 0, 0.55, 0);
+    box(group, darkMat, W * 0.7, 0.5, 0.9, 0, 0.95, -0.3);
+    box(group, darkMat, 0.12, 0.9, 0.12, -W / 2 + 0.25, 1.15, 0.3);
+    box(group, darkMat, 0.12, 0.9, 0.12, W / 2 - 0.25, 1.15, 0.3);
+    box(group, darkMat, W - 0.4, 0.12, 0.12, 0, 1.6, 0.3);
+    addWheel(bigWheelGeo, 0.5, -W / 2 + 0.25, L / 2 - 0.7);
+    addWheel(bigWheelGeo, 0.5, W / 2 - 0.25, L / 2 - 0.7);
+    addWheel(bigWheelGeo, 0.5, -W / 2 + 0.25, -L / 2 + 0.7);
+    addWheel(bigWheelGeo, 0.5, W / 2 - 0.25, -L / 2 + 0.7);
+    addLights(0.6);
+  } else if (type.id === 'van') {
+    // Tall box van with a dark windshield slab on the nose.
+    box(group, paint, W, 1.9, L, 0, 1.25, 0);
+    box(group, glassMat, W * 0.9, 0.7, 0.12, 0, 1.7, L / 2 - 0.04);
+    box(group, darkMat, W * 0.92, 0.25, 0.1, 0, 0.55, L / 2 + 0.02);
+    addWheel(carWheelGeo, 0.36, -W / 2 + 0.2, L / 2 - 0.9);
+    addWheel(carWheelGeo, 0.36, W / 2 - 0.2, L / 2 - 0.9);
+    addWheel(carWheelGeo, 0.36, -W / 2 + 0.2, -L / 2 + 0.9);
+    addWheel(carWheelGeo, 0.36, W / 2 - 0.2, -L / 2 + 0.9);
+    addLights(0.75);
+  } else if (type.id === 'semi') {
+    // Cab up front, long trailer behind, six wheels, one exhaust stack.
+    box(group, paint, W, 1.6, 2.6, 0, 0.95, 4.7);
+    box(group, glassMat, W * 0.9, 0.7, 0.12, 0, 1.35, 5.95);
+    box(group, darkMat, W, 0.35, 0.3, 0, 0.35, 5.9);
+    box(group, trailerMat, W * 0.98, 2.6, 9.2, 0, 1.6, -1.4);
+    const stack = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 2.4, 6), darkMat);
+    stack.position.set(W / 2 - 0.2, 2.2, 3.4);
+    group.add(stack);
+    addWheel(bigWheelGeo, 0.5, -W / 2 + 0.25, 4.8);
+    addWheel(bigWheelGeo, 0.5, W / 2 - 0.25, 4.8);
+    addWheel(bigWheelGeo, 0.5, -W / 2 + 0.25, -1.5);
+    addWheel(bigWheelGeo, 0.5, W / 2 - 0.25, -1.5);
+    addWheel(bigWheelGeo, 0.5, -W / 2 + 0.25, -4.5);
+    addWheel(bigWheelGeo, 0.5, W / 2 - 0.25, -4.5);
+    addLights(0.9);
   } else {
-    V.x = nx;
-    V.z = nz;
+    // Ordinary cars: body, cabin with a glass band, four wheels.
+    box(group, paint, W, 0.7, L, 0, 0.6, 0);
+    if (type.id === 'pickup') {
+      // Cab forward, open bed behind with low side walls.
+      box(group, paint, W * 0.85, 0.6, L * 0.3, 0, 1.25, L * 0.2);
+      box(group, glassMat, W * 0.87, 0.4, L * 0.32, 0, 1.25, L * 0.2);
+      box(group, paint, 0.12, 0.35, L * 0.42, -W / 2 + 0.06, 1.1, -L * 0.26);
+      box(group, paint, 0.12, 0.35, L * 0.42, W / 2 - 0.06, 1.1, -L * 0.26);
+    } else {
+      box(group, paint, W * 0.85, 0.6, L * 0.45, 0, 1.25, -L * 0.05);
+      box(group, glassMat, W * 0.87, 0.4, L * 0.47, 0, 1.25, -L * 0.05);
+    }
+    if (type.id === 'taxi') {
+      box(group, headMat, 0.7, 0.22, 0.3, 0, 1.65, -L * 0.05);
+    }
+    if (type.id === 'muscle') {
+      box(group, darkMat, 0.7, 0.12, 0.9, 0, 1.0, L * 0.28);
+      box(group, darkMat, W * 0.9, 0.08, 0.4, 0, 1.05, -L / 2 + 0.25);
+    }
+    addWheel(carWheelGeo, 0.36, -W / 2 + 0.2, L / 2 - 0.9);
+    addWheel(carWheelGeo, 0.36, W / 2 - 0.2, L / 2 - 0.9);
+    addWheel(carWheelGeo, 0.36, -W / 2 + 0.2, -L / 2 + 0.9);
+    addWheel(carWheelGeo, 0.36, W / 2 - 0.2, -L / 2 + 0.9);
+    addLights(0.7);
   }
 
-  V.mesh.position.set(V.x, 0, V.z);
-  V.mesh.rotation.y = -V.angle;
-
-  const pivots = V.mesh.userData.pivots;
-  const spin = V.speed * dt / (V.mesh.userData.wheelR || 0.36);
-  for (let i = 0; i < pivots.length; i++) {
-    pivots[i].rotation.z -= spin;
-    if (i < 2) pivots[i].rotation.y = -V.steer * 0.45;
-  }
+  return { group, wheels };
 }
 
-export function damageVehicle(V, dmg) {
-  V.hp -= dmg;
-  if (V.hp <= 0 && V.alive) {
-    V.alive = false;
-    V.speed = 0;
-    V.hp = 0;
+export function createVehicles(ctx) {
+  const all = [];
+
+  function spawn(typeId, x, z, heading) {
+    let type = null;
+    for (const t of TYPES) {
+      if (t.id === typeId) type = t;
+    }
+    if (!type) type = ctx.rng.pick(TYPES);
+    const paint = ctx.rng.pick(type.colors);
+    const built = buildVehicleMesh(type, paint);
+    built.group.position.set(x, 0, z);
+    built.group.rotation.y = heading;
+    ctx.scene.add(built.group);
+
+    const vehicle = {
+      group: built.group,
+      type,
+      speed: 0,
+      heading,
+      health: 100,
+      driver: 'none',
+      _wheels: built.wheels,
+      _radius: ((type.length + type.width) / 4) * 0.9,
+
+      drive(throttle, steering, brake, dt) {
+        const top = type.topSpeed;
+        // A wrecked vehicle (health zero) is dead: no throttle, and the
+        // brakes drag it to a stop. Time to find another ride.
+        if (vehicle.health <= 0) {
+          throttle = 0;
+          brake = true;
+        }
+        if (brake) {
+          const decel = 26 * dt;
+          if (Math.abs(vehicle.speed) <= decel) vehicle.speed = 0;
+          else vehicle.speed -= Math.sign(vehicle.speed) * decel;
+        } else {
+          vehicle.speed += throttle * type.accel * dt;
+        }
+        // Air drag always pulls at speed; coasting slows down faster.
+        vehicle.speed -= vehicle.speed * 0.25 * dt;
+        if (!brake && throttle === 0) vehicle.speed -= vehicle.speed * 0.6 * dt;
+        vehicle.speed = clamp(vehicle.speed, -top * 0.4, top);
+
+        // Steering bites only while moving, and weakens as speed rises.
+        // Reversing flips the steering sense, as in a real car.
+        const grip = Math.min(1, Math.abs(vehicle.speed) / 3);
+        const rate = type.turnRate / (1 + Math.abs(vehicle.speed) * 0.045);
+        vehicle.heading += steering * rate * grip * dt * (vehicle.speed >= 0 ? 1 : -1);
+
+        const fx = Math.sin(vehicle.heading);
+        const fz = Math.cos(vehicle.heading);
+        const step = vehicle.speed * dt;
+        const nx = vehicle.group.position.x + fx * step;
+        const nz = vehicle.group.position.z + fz * step;
+
+        // Would this spot hit a wall, a building or the edge of the map?
+        const world = ctx.world;
+        const hits = (px, pz) => {
+          if (!world) return false;
+          const b = world.bounds;
+          const m = vehicle._radius;
+          if (px < b.minX + m || px > b.maxX - m || pz < b.minZ + m || pz > b.maxZ - m) return true;
+          for (const c of world.colliders) {
+            const rr = c.radius + vehicle._radius;
+            const dx = px - c.x;
+            const dz = pz - c.z;
+            if (dx * dx + dz * dz < rr * rr) return true;
+          }
+          return false;
+        };
+
+        // Move one axis at a time so a glancing hit slides along the wall
+        // instead of stopping the car dead.
+        const impact = Math.abs(vehicle.speed);
+        let crashed = false;
+        if (!hits(nx, vehicle.group.position.z)) vehicle.group.position.x = nx;
+        else crashed = true;
+        if (!hits(vehicle.group.position.x, nz)) vehicle.group.position.z = nz;
+        else crashed = true;
+        vehicle.group.rotation.y = vehicle.heading;
+        if (crashed) {
+          if (impact > 9) vehicle.damage((impact - 9) * 1.1);
+          vehicle.speed *= 0.35;
+        }
+      },
+
+      place(x, z, heading) {
+        vehicle.group.position.set(x, 0, z);
+        vehicle.heading = heading;
+        vehicle.group.rotation.y = heading;
+        vehicle.speed = 0;
+      },
+
+      damage(amount) {
+        vehicle.health = Math.max(0, vehicle.health - amount);
+      },
+
+      remove() {
+        ctx.scene.remove(vehicle.group);
+        const i = all.indexOf(vehicle);
+        if (i >= 0) all.splice(i, 1);
+      },
+    };
+
+    all.push(vehicle);
+    return vehicle;
   }
+
+  // Visual details only: spin every wheel to match its vehicle's speed.
+  function update(dt) {
+    for (const v of all) {
+      const spin = v.speed * dt;
+      for (const w of v._wheels) w.mesh.rotation.x += spin / w.radius;
+    }
+  }
+
+  return { types: TYPES, spawn, all, update };
 }

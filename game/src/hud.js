@@ -1,299 +1,310 @@
-// HUD, menus and minimap for Dustline.
-//
-// The HUD reads the game object every frame and mirrors it into the DOM:
-// wanted stars, money, health, speed, weapon, objective, district and
-// relic count, plus a circular minimap drawn on a 180x180 canvas. Menus
-// are plain DOM overlays; button clicks are forwarded to H.onAction so
-// main.js decides what each action does.
+// Dustline HUD: every DOM element, the minimap canvas, menus and buttons.
+// The only module allowed to touch the DOM. Every element lookup is guarded,
+// so a missing id is skipped silently instead of throwing.
 
-const $ = (id) => document.getElementById(id);
+import { clamp } from './utils.js';
 
-export function createHUD() {
-  const el = {
-    hud: $('hud'),
-    wanted: $('wanted'),
-    money: $('money'),
-    healthFill: $('health-fill'),
-    speed: $('speed'),
-    weapon: $('weapon'),
-    ammo: $('ammo'),
-    objective: $('objective'),
-    message: $('message'),
-    map: $('minimap'),
-    crosshair: $('crosshair'),
-    district: $('district'),
-    relics: $('relics'),
-  };
+const ELEMENT_IDS = [
+  'hud', 'healthFill', 'healthText', 'stars', 'moneyText', 'speedText',
+  'weaponText', 'ammoText', 'relicText', 'objectiveText', 'banner', 'toast',
+  'minimap', 'crosshair', 'damageFlash',
+  'menuTitle', 'menuPause', 'menuHelp', 'menuWasted', 'menuBusted',
+  'btnStart', 'btnContinue', 'btnResume', 'btnRestart', 'btnHelp', 'btnHelpBack',
+  'muteBtn',
+];
 
-  const menus = {
-    title: $('menu-title'),
-    pause: $('menu-pause'),
-    help: $('menu-help'),
-    wasted: $('menu-wasted'),
-    busted: $('menu-busted'),
-  };
+const WEAPON_NAMES = { fists: 'Fists', pistol: 'Pistol', smg: 'SMG' };
+const BANNER_SECONDS = 4;
+const TOAST_SECONDS = 2.5;
 
-  const mapCtx = el.map ? el.map.getContext('2d') : null;
+export function createHUD(ctx) {
+  const state = ctx.state;
 
-  let flashUntil = 0;      // performance.now() deadline for the message
-  let districtAt = 0;      // last time the district name was recomputed
-  let districtName = '';   // cached nearest district
-
-  const H = {
-    // Set by main.js: called with 'start', 'load', 'resume', ... on click.
-    onAction: null,
-
-    // Show one menu and hide the rest. Title/wasted/busted hide the HUD.
-    showMenu(name) {
-      for (const key in menus) {
-        if (menus[key]) menus[key].classList.add('hidden');
-      }
-      if (menus[name]) menus[name].classList.remove('hidden');
-      if (el.hud) {
-        el.hud.classList.toggle('hidden',
-          name === 'title' || name === 'wasted' || name === 'busted');
-      }
-    },
-
-    // Hide every menu and bring the HUD back.
-    hideAllMenus() {
-      for (const key in menus) {
-        if (menus[key]) menus[key].classList.add('hidden');
-      }
-      if (el.hud) el.hud.classList.remove('hidden');
-    },
-
-    // Flash a message in the centre of the screen for `ms` milliseconds.
-    flash(msg, ms = 2500) {
-      if (!el.message) return;
-      el.message.textContent = msg;
-      el.message.style.display = '';
-      el.message.style.opacity = '1';
-      flashUntil = performance.now() + ms;
-    },
-
-    update(G) {
-      const player = G.player;
-      const combat = G.combat;
-      const missions = G.missions;
-      const world = G.world;
-      const police = G.police;
-      const now = performance.now();
-
-      // Hide the flash message once its time is up.
-      if (el.message && flashUntil && now > flashUntil) {
-        el.message.style.display = 'none';
-        flashUntil = 0;
-      }
-
-      // Wanted stars: filled for the current level, dim when clean.
-      const wanted = police ? police.wanted || 0 : 0;
-      if (el.wanted) {
-        el.wanted.textContent = '★'.repeat(wanted) + '☆'.repeat(5 - wanted);
-        el.wanted.style.opacity = wanted > 0 ? '1' : '0.45';
-      }
-
-      if (el.money) el.money.textContent = '$' + G.money;
-
-      // Health bar: width follows health, colour green > amber > red.
-      if (el.healthFill) {
-        const hp = Math.max(0, Math.min(100, player.health));
-        el.healthFill.style.width = hp + '%';
-        el.healthFill.style.background = hp > 50 ? '#4caf50' : hp > 25 ? '#ffb020' : '#e33';
-      }
-
-      const vehicle = player.vehicle || null;
-
-      // Speed, only while driving (world units/s -> mph).
-      if (el.speed) {
-        el.speed.textContent = vehicle ? Math.round(vehicle.speed * 2.237) + ' mph' : '';
-      }
-
-      // Weapon line: name plus mag/reserve for guns, 'Fists' otherwise.
-      const weapon = combat ? combat.weapon : 'fists';
-      const armed = weapon === 'pistol' || weapon === 'smg';
-      const weaponName = armed ? (weapon === 'pistol' ? 'Pistol' : 'SMG') : 'Fists';
-      const ammoText = armed ? (combat.mag[weapon] ?? 0) + '/' + (combat.ammo[weapon] ?? 0) : '';
-      if (el.weapon) el.weapon.textContent = armed ? weaponName + ' ' + ammoText : weaponName;
-      if (el.ammo) el.ammo.textContent = ammoText;
-
-      if (el.objective) el.objective.textContent = G.objective || '';
-
-      // District: nearest named district, recomputed at most twice a second.
-      if (el.district && world && world.districts && now - districtAt > 500) {
-        districtAt = now;
-        let best = null;
-        let bestDist = Infinity;
-        for (const d of world.districts) {
-          const dx = (d.x ?? d.cx ?? 0) - player.x;
-          const dz = (d.z ?? d.cz ?? 0) - player.z;
-          const q = dx * dx + dz * dz;
-          if (q < bestDist) {
-            bestDist = q;
-            best = d;
-          }
-        }
-        districtName = best ? best.name : '';
-        el.district.textContent = districtName;
-      }
-
-      if (el.relics && missions && missions.relics) {
-        const found = missions.relics.found;
-        el.relics.textContent = 'Relics ' + (found.size ?? found.length ?? 0) + '/10';
-      }
-
-      // Crosshair: only on foot, playing, holding a gun.
-      if (el.crosshair) {
-        const show = !vehicle && G.state === 'playing' && armed;
-        el.crosshair.style.display = show ? '' : 'none';
-      }
-
-      drawMinimap(G, vehicle);
-    },
-  };
-
-  // Circular minimap: roads, districts, unfound relics, active target,
-  // police units and the player arrow. The map covers ±230 world units
-  // across the 180px canvas with a 6px margin.
-  function drawMinimap(G, vehicle) {
-    if (!mapCtx) return;
-    const SIZE = 180;
-    const HALF = SIZE / 2;
-    const MARGIN = 6;
-    const scale = (SIZE - MARGIN * 2) / 460;
-    const toX = (x) => HALF + x * scale;
-    const toY = (z) => HALF + z * scale;
-
-    const ctx = mapCtx;
-    const player = G.player;
-    const world = G.world;
-    const missions = G.missions;
-    const police = G.police;
-
-    ctx.save();
-    ctx.clearRect(0, 0, SIZE, SIZE);
-    ctx.beginPath();
-    ctx.arc(HALF, HALF, HALF - 1, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.fillStyle = '#241d12';
-    ctx.fillRect(0, 0, SIZE, SIZE);
-
-    // Roads: support the {x1,z1,x2,z2} form plus a few alternates.
-    if (world && world.roads) {
-      ctx.strokeStyle = '#8a7a5a';
-      ctx.lineWidth = 2;
-      for (const road of world.roads) {
-        ctx.beginPath();
-        if (Array.isArray(road)) {
-          road.forEach((pt, i) => {
-            if (i) ctx.lineTo(toX(pt[0]), toY(pt[1]));
-            else ctx.moveTo(toX(pt[0]), toY(pt[1]));
-          });
-        } else if (road.x1 !== undefined) {
-          ctx.moveTo(toX(road.x1), toY(road.z1));
-          ctx.lineTo(toX(road.x2), toY(road.z2));
-        } else if (road.a && road.b) {
-          ctx.moveTo(toX(road.a.x), toY(road.a.z));
-          ctx.lineTo(toX(road.b.x), toY(road.b.z));
-        } else if (road.x !== undefined && road.z !== undefined && road.x2 !== undefined) {
-          ctx.moveTo(toX(road.x), toY(road.z));
-          ctx.lineTo(toX(road.x2), toY(road.z2));
-        }
-        ctx.stroke();
-      }
+  function $(id) {
+    try {
+      return document.getElementById(id);
+    } catch (e) {
+      return null;
     }
-
-    // District dots.
-    if (world && world.districts) {
-      ctx.fillStyle = '#6b5d43';
-      for (const d of world.districts) {
-        ctx.beginPath();
-        ctx.arc(toX(d.x ?? d.cx ?? 0), toY(d.z ?? d.cz ?? 0), 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-
-    // Unfound relics as cyan dots.
-    const relicSpots = (missions && missions.relics && (missions.relics.list || missions.relics.items || missions.relics.all))
-      || (world && (world.relics || world.relicSpots))
-      || [];
-    const found = (missions && missions.relics && missions.relics.found) || new Set();
-    ctx.fillStyle = '#22d3ee';
-    relicSpots.forEach((spot, i) => {
-      if (found.has ? found.has(i) : found.includes(i)) return;
-      ctx.beginPath();
-      ctx.arc(toX(spot.x ?? 0), toY(spot.z ?? 0), 2.5, 0, Math.PI * 2);
-      ctx.fill();
-    });
-
-    // Active mission target: a blinking yellow diamond.
-    const target = missions ? missions.activeTarget : null;
-    if (target && Math.floor(performance.now() / 400) % 2 === 0) {
-      const tx = toX(target.x ?? 0);
-      const ty = toY(target.z ?? 0);
-      ctx.fillStyle = '#ffd21f';
-      ctx.beginPath();
-      ctx.moveTo(tx, ty - 5);
-      ctx.lineTo(tx + 4, ty);
-      ctx.lineTo(tx, ty + 5);
-      ctx.lineTo(tx - 4, ty);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    // Police units as blue dots.
-    ctx.fillStyle = '#3b82f6';
-    const units = [];
-    if (police) {
-      if (police.cars) units.push(...police.cars);
-      if (police.cops) units.push(...police.cops);
-      if (police.units) units.push(...police.units);
-    }
-    for (const unit of units) {
-      ctx.beginPath();
-      ctx.arc(toX(unit.x ?? 0), toY(unit.z ?? 0), 2.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Player arrow, rotated by heading.
-    const heading = vehicle ? vehicle.angle : player.angle;
-    ctx.save();
-    ctx.translate(toX(player.x), toY(player.z));
-    ctx.rotate(heading + Math.PI / 2);
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.moveTo(0, -6);
-    ctx.lineTo(4, 5);
-    ctx.lineTo(-4, 5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-
-    ctx.restore();
   }
 
-  // Wire every menu button to the onAction callback with its action name.
-  function wireButton(id, action) {
-    const button = $(id);
-    if (button) {
-      button.addEventListener('click', () => {
-        if (H.onAction) H.onAction(action);
+  const el = {};
+  ELEMENT_IDS.forEach((id) => {
+    el[id] = $(id);
+  });
+
+  let mapCtx = null;
+  if (el.minimap) {
+    try {
+      mapCtx = el.minimap.getContext('2d');
+    } catch (e) {
+      mapCtx = null;
+    }
+  }
+
+  let bannerTimer = 0;
+  let toastTimer = 0;
+  let lastHealth = typeof state.health === 'number' ? state.health : 100;
+  let flash = 0;
+  let lastFlash = '';
+  let helpFrom = 'title';
+
+  function show(node, on, display) {
+    if (!node) return;
+    node.style.display = on ? (display || 'flex') : 'none';
+  }
+
+  function showBanner(text) {
+    if (!el.banner) return;
+    el.banner.textContent = text;
+    el.banner.style.display = 'block';
+    bannerTimer = BANNER_SECONDS;
+  }
+
+  function showToast(text) {
+    if (!el.toast) return;
+    el.toast.textContent = text;
+    el.toast.style.display = 'block';
+    toastTimer = TOAST_SECONDS;
+  }
+
+  function updateMuteLabel() {
+    if (el.muteBtn) el.muteBtn.textContent = state.muted ? 'Sound: Off' : 'Sound: On';
+  }
+  updateMuteLabel();
+
+  function onClick(node, fn) {
+    if (!node) return;
+    node.addEventListener('click', () => {
+      try {
+        fn();
+      } catch (e) { /* a button must never break the game */ }
+    });
+  }
+
+  onClick(el.btnStart, () => {
+    if (ctx.audio && ctx.audio.resume) ctx.audio.resume();
+    state.mode = 'playing';
+  });
+  onClick(el.btnContinue, () => {
+    try {
+      if (ctx.save && ctx.save.load) ctx.save.load();
+    } catch (e) { /* a bad save still starts the game */ }
+    if (ctx.audio && ctx.audio.resume) ctx.audio.resume();
+    state.mode = 'playing';
+  });
+  onClick(el.btnResume, () => {
+    state.mode = 'playing';
+  });
+  onClick(el.btnRestart, () => {
+    try {
+      window.location.reload();
+    } catch (e) { /* ignore */ }
+  });
+  onClick(el.btnHelp, () => {
+    helpFrom = state.mode === 'paused' ? 'paused' : 'title';
+    state.mode = 'help';
+  });
+  onClick(el.btnHelpBack, () => {
+    state.mode = helpFrom;
+  });
+  onClick(el.muteBtn, () => {
+    state.muted = !state.muted;
+    try {
+      if (ctx.audio && ctx.audio.setMuted) ctx.audio.setMuted(state.muted);
+    } catch (e) { /* audio is optional */ }
+    updateMuteLabel();
+  });
+
+  // -- minimap ---------------------------------------------------------------
+
+  function playerSpot() {
+    const p = ctx.player;
+    if (!p) return null;
+    const g = p.car ? p.car.group : p.group;
+    if (!g || !g.position) return null;
+    return { x: g.position.x, z: g.position.z, heading: p.heading || 0 };
+  }
+
+  function drawMinimap() {
+    if (!mapCtx || !el.minimap) return;
+    const world = ctx.world;
+    if (!world || !world.bounds) return;
+    const w = el.minimap.width;
+    const h = el.minimap.height;
+    if (!w || !h) return;
+    const b = world.bounds;
+    const spanX = b.maxX - b.minX || 1;
+    const spanZ = b.maxZ - b.minZ || 1;
+    // North up: the smallest z (north edge) maps to the top of the canvas.
+    const toX = (x) => ((x - b.minX) / spanX) * w;
+    const toY = (z) => ((z - b.minZ) / spanZ) * h;
+
+    mapCtx.clearRect(0, 0, w, h);
+    mapCtx.fillStyle = 'rgba(8, 12, 16, 0.82)';
+    mapCtx.fillRect(0, 0, w, h);
+
+    // Roads, drawn as one path.
+    if (Array.isArray(world.roads)) {
+      mapCtx.strokeStyle = 'rgba(210, 210, 210, 0.55)';
+      mapCtx.lineWidth = 1;
+      mapCtx.beginPath();
+      world.roads.forEach((r) => {
+        mapCtx.moveTo(toX(r.ax), toY(r.az));
+        mapCtx.lineTo(toX(r.bx), toY(r.bz));
+      });
+      mapCtx.stroke();
+    }
+
+    // Uncollected relics as turquoise dots.
+    if (ctx.missions && Array.isArray(ctx.missions.relics)) {
+      mapCtx.fillStyle = '#2de2c5';
+      ctx.missions.relics.forEach((r) => {
+        if (r.collected) return;
+        mapCtx.beginPath();
+        mapCtx.arc(toX(r.x), toY(r.z), 2, 0, Math.PI * 2);
+        mapCtx.fill();
       });
     }
-  }
-  wireButton('btn-start', 'start');
-  wireButton('btn-load', 'load');
-  wireButton('btn-load-wasted', 'load');
-  wireButton('btn-load-busted', 'load');
-  wireButton('btn-resume', 'resume');
-  wireButton('btn-save', 'save');
-  wireButton('btn-restart', 'restart');
-  wireButton('btn-help', 'help');
-  wireButton('btn-help-title', 'help');
-  wireButton('btn-help-back', 'help-back');
-  wireButton('btn-quit', 'quit');
-  wireButton('btn-retry-wasted', 'retry');
-  wireButton('btn-retry-busted', 'retry');
 
-  return H;
+    // Current mission marker as an amber diamond.
+    const marker = ctx.missions ? ctx.missions.marker : null;
+    if (marker) {
+      const mx = toX(marker.x);
+      const my = toY(marker.z);
+      mapCtx.fillStyle = '#ffb020';
+      mapCtx.beginPath();
+      mapCtx.moveTo(mx, my - 5);
+      mapCtx.lineTo(mx + 4, my);
+      mapCtx.lineTo(mx, my + 5);
+      mapCtx.lineTo(mx - 4, my);
+      mapCtx.closePath();
+      mapCtx.fill();
+    }
+
+    // Police: officers blue, cars and helicopter red.
+    const police = ctx.police;
+    if (police) {
+      if (Array.isArray(police.cops)) {
+        mapCtx.fillStyle = '#3f8cff';
+        police.cops.forEach((c) => {
+          const g = c && c.group;
+          if (!g || !g.position) return;
+          mapCtx.beginPath();
+          mapCtx.arc(toX(g.position.x), toY(g.position.z), 2.5, 0, Math.PI * 2);
+          mapCtx.fill();
+        });
+      }
+      mapCtx.fillStyle = '#ff3b30';
+      if (Array.isArray(police.cars)) {
+        police.cars.forEach((c) => {
+          // A patrol entry wraps its vehicle: the mesh lives under .vehicle.
+          const g = c && (c.group || (c.vehicle && c.vehicle.group));
+          if (!g || !g.position) return;
+          mapCtx.beginPath();
+          mapCtx.arc(toX(g.position.x), toY(g.position.z), 3, 0, Math.PI * 2);
+          mapCtx.fill();
+        });
+      }
+      if (police.heli && police.heli.group && police.heli.group.position) {
+        const hp = police.heli.group.position;
+        mapCtx.beginPath();
+        mapCtx.arc(toX(hp.x), toY(hp.z), 3, 0, Math.PI * 2);
+        mapCtx.fill();
+      }
+    }
+
+    // Player triangle, pointing along the heading.
+    const spot = playerSpot();
+    if (spot) {
+      const px = toX(spot.x);
+      const py = toY(spot.z);
+      // Forward on the map is (sin h, cos h); rotate the nose there.
+      const angle = Math.atan2(Math.cos(spot.heading), Math.sin(spot.heading));
+      mapCtx.save();
+      mapCtx.translate(px, py);
+      mapCtx.rotate(angle);
+      mapCtx.fillStyle = '#ffffff';
+      mapCtx.strokeStyle = '#111111';
+      mapCtx.lineWidth = 1;
+      mapCtx.beginPath();
+      mapCtx.moveTo(7, 0);
+      mapCtx.lineTo(-5, 4.5);
+      mapCtx.lineTo(-5, -4.5);
+      mapCtx.closePath();
+      mapCtx.fill();
+      mapCtx.stroke();
+      mapCtx.restore();
+    }
+  }
+
+  // -- per-frame update ------------------------------------------------------
+
+  function update(dt) {
+    const mode = state.mode || 'title';
+
+    // Banner and toast timers.
+    if (bannerTimer > 0) {
+      bannerTimer -= dt;
+      if (bannerTimer <= 0 && el.banner) el.banner.style.display = 'none';
+    }
+    if (toastTimer > 0) {
+      toastTimer -= dt;
+      if (toastTimer <= 0 && el.toast) el.toast.style.display = 'none';
+    }
+
+    // Damage flash: light up when health drops, then fade away.
+    const health = typeof state.health === 'number' ? state.health : 100;
+    if (health < lastHealth) flash = 0.55;
+    lastHealth = health;
+    if (flash > 0) flash = Math.max(0, flash - dt * 1.4);
+    if (el.damageFlash && flash.toFixed(2) !== lastFlash) {
+      lastFlash = flash.toFixed(2);
+      el.damageFlash.style.opacity = lastFlash;
+    }
+
+    // Menus follow the mode word; while playing, all menus hide.
+    show(el.menuTitle, mode === 'title');
+    show(el.menuPause, mode === 'paused');
+    show(el.menuHelp, mode === 'help');
+    show(el.menuWasted, mode === 'wasted');
+    show(el.menuBusted, mode === 'busted');
+    show(el.hud, mode === 'playing' || mode === 'paused', 'block');
+    if (el.btnContinue) {
+      const showContinue = mode === 'title' && !!(ctx.save && ctx.save.hasSave);
+      el.btnContinue.style.display = showContinue ? 'inline-block' : 'none';
+    }
+
+    // Stat readouts.
+    if (el.healthFill) el.healthFill.style.width = `${clamp(health, 0, 100)}%`;
+    if (el.healthText) el.healthText.textContent = `${Math.round(health)} HP`;
+    if (el.stars) {
+      const wanted = clamp(state.wanted || 0, 0, 5);
+      el.stars.textContent = '★'.repeat(wanted) + '☆'.repeat(5 - wanted);
+    }
+    if (el.moneyText) el.moneyText.textContent = `$${Math.floor(state.money || 0)}`;
+    if (el.speedText) {
+      const p = ctx.player;
+      const speed = p ? (p.car ? p.car.speed || 0 : p.speed || 0) : 0;
+      el.speedText.textContent = `${Math.round(Math.abs(speed) * 2.237)} mph`;
+    }
+    if (el.weaponText) el.weaponText.textContent = WEAPON_NAMES[state.weapon] || 'Fists';
+    if (el.ammoText) {
+      if (state.weapon === 'pistol') el.ammoText.textContent = `${state.ammoPistol || 0}`;
+      else if (state.weapon === 'smg') el.ammoText.textContent = `${state.ammoSmg || 0}`;
+      else el.ammoText.textContent = '∞';
+    }
+    if (el.relicText) el.relicText.textContent = `${state.relicsFound || 0} / 10`;
+    if (el.objectiveText) el.objectiveText.textContent = state.objective || '';
+
+    // Crosshair: armed and playing, never in shot mode.
+    const armed = state.weapon === 'pistol' || state.weapon === 'smg';
+    show(el.crosshair, mode === 'playing' && armed && !state.shotMode, 'block');
+
+    // The minimap lives inside the hud container, so it only needs drawing
+    // while the hud is visible.
+    if (mode === 'playing' || mode === 'paused') drawMinimap();
+  }
+
+  return { update, showBanner, showToast };
 }

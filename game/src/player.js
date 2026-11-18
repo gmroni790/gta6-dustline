@@ -1,231 +1,266 @@
-// Rae, the player character: a boxy on-foot figure who can steal and drive cars.
-// Movement on foot is relative to the camera yaw; driving hands control to the
-// vehicle physics in vehicles.js and mirrors the car back onto the player.
-import * as THREE from 'three';
-import { driveVehicle } from './vehicles.js';
+// Dustline — player module.
+// Rae Calloway, courier and driver, on foot and behind the wheel.
+// Owns the on-foot figure, walking, sprinting, entering and exiting cars,
+// and the wasted check. The camera itself is driven by the coordinator.
 
-const FULL_TURN = Math.PI * 2;
-const EDGE = 229;
+import * as THREE from '../vendor/three.module.min.js';
+import { clamp, damp, angleLerp, dist2 } from './utils.js';
 
-function clampNum(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
-}
+const WALK_SPEED = 5.2;
+const SPRINT_SPEED = 10.4;
+const PLAYER_RADIUS = 0.55;
+const ENTER_RANGE = 4.5;
+const EXIT_OFFSET = 2.4;
 
-function wrapAngle(a) {
-  while (a > Math.PI) a -= FULL_TURN;
-  while (a < -Math.PI) a += FULL_TURN;
-  return a;
-}
+export function createPlayer(ctx) {
+  const { scene, input, state } = ctx;
 
-// Build the figure: dark jeans, teal jacket, skin-tone head and a red cap.
-// Each leg hangs from a pivot at hip height so it can swing while walking.
-function buildFigure() {
+  // ----- Rae's figure, built from boxes, facing +z -----
   const group = new THREE.Group();
-  const denim = new THREE.MeshStandardMaterial({ color: 0x2b3a55 });
-  const teal = new THREE.MeshStandardMaterial({ color: 0x0f766e });
-  const skin = new THREE.MeshStandardMaterial({ color: 0xd9a077 });
-  const red = new THREE.MeshStandardMaterial({ color: 0x8a2f2f });
+  const body = new THREE.Group();
+  group.add(body);
 
-  const addBox = (w, h, d, mat, x, y, z) => {
-    const part = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-    part.position.set(x, y, z);
-    group.add(part);
-    return part;
-  };
-  const addLeg = (side) => {
-    const geo = new THREE.BoxGeometry(0.17, 0.8, 0.19);
-    geo.translate(0, -0.4, 0);
-    const leg = new THREE.Mesh(geo, denim);
-    leg.position.set(side, 0.8, 0);
-    group.add(leg);
-    return leg;
-  };
+  const vestMat = new THREE.MeshStandardMaterial({ color: 0xd97a2b, roughness: 0.85 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x2e3138, roughness: 0.9 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: 0xc98d64, roughness: 0.8 });
+  const rustMat = new THREE.MeshStandardMaterial({ color: 0x7a2e1d, roughness: 0.8 });
+  const paleMat = new THREE.MeshStandardMaterial({ color: 0xe8dcc8, roughness: 0.9 });
 
-  const leftLeg = addLeg(-0.11);
-  const rightLeg = addLeg(0.11);
-  addBox(0.52, 0.62, 0.3, teal, 0, 1.11, 0); // torso
-  addBox(0.3, 0.3, 0.3, skin, 0, 1.6, 0); // head
-  addBox(0.34, 0.12, 0.34, red, 0, 1.76, 0); // cap crown
-  addBox(0.24, 0.05, 0.26, red, 0.24, 1.72, 0); // cap brim
-  addBox(0.13, 0.55, 0.15, teal, -0.34, 1.1, 0); // left arm
-  addBox(0.13, 0.55, 0.15, teal, 0.34, 1.1, 0); // right arm
-  return { group, leftLeg, rightLeg };
-}
-
-// Step out of the car to its left; if that side is blocked, use the right.
-function stepOut(P, G) {
-  const car = P.vehicle;
-  if (!car) {
-    P.onFoot = true;
-    P.mesh.visible = true;
-    return;
+  function box(w, h, d, mat, x, y, z, parent) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    mesh.position.set(x, y, z);
+    (parent || body).add(mesh);
+    return mesh;
   }
-  const sideX = Math.sin(car.angle);
-  const sideZ = -Math.cos(car.angle);
-  let outX = car.x + sideX * 2.5;
-  let outZ = car.z + sideZ * 2.5;
-  if (G.world.collides(outX, outZ, 0.6)) {
-    outX = car.x - sideX * 2.5;
-    outZ = car.z - sideZ * 2.5;
-  }
-  P.x = clampNum(outX, -EDGE, EDGE);
-  P.z = clampNum(outZ, -EDGE, EDGE);
-  P.angle = car.angle;
-  P.heading = car.angle;
-  P.speed = 0;
-  car.driver = null;
-  P.vehicle = null;
-  P.onFoot = true;
-  P.mesh.visible = true;
-  P.mesh.position.set(P.x, 0, P.z);
-  P.mesh.rotation.y = -P.angle;
-}
 
-// Climb into the closest drivable car. Taking a traffic car pulls it out of
-// the traffic flow; taking a cop car draws one star of heat.
-function stepIn(P, G) {
-  let closest = null;
-  let closestSq = 4.5 * 4.5;
-  for (const car of G.vehicles) {
-    if (!car.alive || car.driver === 'player') continue;
-    const dx = car.x - P.x;
-    const dz = car.z - P.z;
-    const distSq = dx * dx + dz * dz;
-    if (distSq < closestSq) {
-      closestSq = distSq;
-      closest = car;
+  // Torso in a courier's orange vest, with a pale stripe across the chest.
+  box(0.62, 0.78, 0.36, vestMat, 0, 1.18, 0);
+  box(0.5, 0.1, 0.02, paleMat, 0, 1.3, 0.19);
+  box(0.2, 0.3, 0.06, rustMat, 0, 1.05, 0.2); // satchel flap on the chest
+  // Head, hair and a rust-red cap with a brim.
+  box(0.34, 0.36, 0.34, skinMat, 0, 1.78, 0);
+  box(0.38, 0.12, 0.38, rustMat, 0, 1.99, 0);
+  box(0.36, 0.05, 0.22, rustMat, 0, 1.94, 0.26);
+  // Legs hang from hip pivots so they can swing while walking.
+  const legL = new THREE.Group();
+  legL.position.set(-0.17, 0.82, 0);
+  body.add(legL);
+  box(0.22, 0.82, 0.26, darkMat, 0, -0.41, 0, legL);
+  const legR = new THREE.Group();
+  legR.position.set(0.17, 0.82, 0);
+  body.add(legR);
+  box(0.22, 0.82, 0.26, darkMat, 0, -0.41, 0, legR);
+  // Arms hang from shoulder pivots and swing opposite the legs.
+  const armL = new THREE.Group();
+  armL.position.set(-0.42, 1.5, 0);
+  body.add(armL);
+  box(0.18, 0.72, 0.22, vestMat, 0, -0.36, 0, armL);
+  const armR = new THREE.Group();
+  armR.position.set(0.42, 1.5, 0);
+  body.add(armR);
+  box(0.18, 0.72, 0.22, vestMat, 0, -0.36, 0, armR);
+
+  scene.add(group);
+
+  // ----- State -----
+  let car = null; // vehicle object while driving, otherwise null
+  let heading = 0;
+  let speed = 0;
+  let bobPhase = 0;
+  let placed = false; // true once we have taken the start position from world
+
+  // Keep a ground position inside the bounds and out of every collider.
+  // Pushing out radially lets the player slide along a building wall.
+  function resolveCollisions(pos) {
+    const world = ctx.world;
+    if (!world) return;
+    const b = world.bounds;
+    if (b) {
+      pos.x = clamp(pos.x, b.minX + PLAYER_RADIUS, b.maxX - PLAYER_RADIUS);
+      pos.z = clamp(pos.z, b.minZ + PLAYER_RADIUS, b.maxZ - PLAYER_RADIUS);
     }
-  }
-  if (!closest) return;
-  if (closest.driver === 'traffic' && G.traffic) {
-    const idx = G.traffic.cars.indexOf(closest);
-    if (idx >= 0) G.traffic.cars.splice(idx, 1);
-  }
-  if (closest.driver === 'cop') G.police.addWanted(1);
-  closest.driver = 'player';
-  P.vehicle = closest;
-  P.onFoot = false;
-  P.mesh.visible = false;
-}
-
-export function createPlayer(scene, world, spawn) {
-  const figure = buildFigure();
-  const P = {
-    mesh: figure.group,
-    legL: figure.leftLeg,
-    legR: figure.rightLeg,
-    x: spawn.x,
-    z: spawn.z,
-    angle: spawn.angle || 0,
-    heading: spawn.angle || 0,
-    speed: 0,
-    health: 100,
-    onFoot: true,
-    vehicle: null,
-    camX: spawn.x,
-    camY: 2.2,
-    camZ: spawn.z,
-    phase: 0,
-    _G: null,
-    hurt(dmg) {
-      this.health -= dmg;
-      if (this.health <= 0 && this._G && this._G.state === 'playing') {
-        this._G.state = 'wasted';
-        if (this._G.audio) this._G.audio.wasted();
+    const colliders = world.colliders || [];
+    for (let i = 0; i < colliders.length; i++) {
+      const c = colliders[i];
+      const dx = pos.x - c.x;
+      const dz = pos.z - c.z;
+      const min = c.radius + PLAYER_RADIUS;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < min * min && d2 > 1e-6) {
+        const d = Math.sqrt(d2);
+        pos.x = c.x + (dx / d) * min;
+        pos.z = c.z + (dz / d) * min;
       }
-    },
-  };
-  P.mesh.position.set(P.x, 0, P.z);
-  P.mesh.rotation.y = -P.angle;
-  scene.add(P.mesh);
-  return P;
-}
-
-export function updatePlayer(P, input, dt, G) {
-  P._G = G;
-  const audio = G.audio;
-
-  // A wrecked car dumps its driver on the spot.
-  if (P.vehicle && !P.vehicle.alive) stepOut(P, G);
-
-  if (input.pressed.has('KeyE') && G.state === 'playing') {
-    if (P.onFoot) stepIn(P, G);
-    else stepOut(P, G);
+    }
   }
 
-  if (G.state !== 'playing') {
-    if (audio) audio.engine(0, false);
-    P.camX = P.x;
-    P.camY = 2.2;
-    P.camZ = P.z;
-    return;
+  function updateOnFoot(dt) {
+    const cam = ctx.camHeading || 0;
+    const fwd = (input.keys.has('KeyW') ? 1 : 0) - (input.keys.has('KeyS') ? 1 : 0);
+    const strafe = (input.keys.has('KeyD') ? 1 : 0) - (input.keys.has('KeyA') ? 1 : 0);
+    const sprint = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight');
+    // Camera-relative axes: forward is away from the camera, right is screen-right.
+    const fx = Math.sin(cam);
+    const fz = Math.cos(cam);
+    const rx = -Math.cos(cam);
+    const rz = Math.sin(cam);
+    let mx = fx * fwd + rx * strafe;
+    let mz = fz * fwd + rz * strafe;
+    const len = Math.hypot(mx, mz);
+    const targetSpeed = len > 0 ? (sprint ? SPRINT_SPEED : WALK_SPEED) : 0;
+    if (len > 0) {
+      mx /= len;
+      mz /= len;
+    }
+    speed = damp(speed, targetSpeed, 8, dt);
+
+    const p = group.position;
+    p.x += mx * speed * dt;
+    p.z += mz * speed * dt;
+    resolveCollisions(p);
+
+    if (len > 0) {
+      heading = angleLerp(heading, Math.atan2(mx, mz), 1 - Math.exp(-12 * dt));
+    }
+    group.rotation.y = heading;
+
+    // Walk cycle: swinging limbs, a small bob and a slight forward lean.
+    bobPhase += speed * dt * 1.4;
+    const swing = clamp(speed / WALK_SPEED, 0, 1.6) * 0.55;
+    const s = Math.sin(bobPhase);
+    legL.rotation.x = s * swing;
+    legR.rotation.x = -s * swing;
+    armL.rotation.x = -s * swing * 0.8;
+    armR.rotation.x = s * swing * 0.8;
+    body.position.y = Math.abs(s) * 0.07 * clamp(speed / WALK_SPEED, 0, 1);
+    body.rotation.x = damp(body.rotation.x, speed > 0.5 ? 0.09 : 0, 6, dt);
   }
 
-  if (P.onFoot) {
-    if (audio) audio.engine(0, false);
-    const keys = input.keys;
-    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-    const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-    let bob = 0;
-    if (forward || strafe) {
-      // W walks away from the camera; A/D strafe across the view.
-      const yaw = G.camYaw;
-      const fwdX = Math.cos(yaw);
-      const fwdZ = Math.sin(yaw);
-      const rightX = -Math.sin(yaw);
-      const rightZ = Math.cos(yaw);
-      let moveX = fwdX * forward + rightX * strafe;
-      let moveZ = fwdZ * forward + rightZ * strafe;
-      const len = Math.hypot(moveX, moveZ) || 1;
-      moveX /= len;
-      moveZ /= len;
-      const sprinting = keys.has('ShiftLeft') || keys.has('ShiftRight');
-      const pace = sprinting ? 8 : 5;
-      P.speed = pace;
-      // Move one axis at a time so walls slide instead of snagging.
-      const nextX = P.x + moveX * pace * dt;
-      const nextZ = P.z + moveZ * pace * dt;
-      if (!G.world.collides(nextX, P.z, 0.6)) P.x = clampNum(nextX, -EDGE, EDGE);
-      if (!G.world.collides(P.x, nextZ, 0.6)) P.z = clampNum(nextZ, -EDGE, EDGE);
-      const target = Math.atan2(moveZ, moveX);
-      P.angle += clampNum(wrapAngle(target - P.angle), -10 * dt, 10 * dt);
-      P.phase += dt * pace * 1.4;
-      const swing = Math.sin(P.phase) * 0.6;
-      P.legL.rotation.x = swing;
-      P.legR.rotation.x = -swing;
-      bob = Math.abs(Math.sin(P.phase)) * 0.04;
+  function updateDriving(dt) {
+    // A wrecked car throws Rae out instead of trapping her in a dead shell.
+    if (car.health <= 0) {
+      group.position.copy(car.group.position);
+      group.position.y = 0;
+      resolveCollisions(group.position);
+      car.driver = 'none';
+      car = null;
+      speed = 0;
+      group.visible = true;
+      return;
+    }
+    const throttle = (input.keys.has('KeyW') ? 1 : 0) - (input.keys.has('KeyS') ? 1 : 0);
+    // Positive steering raises the heading, which turns the car left, so the
+    // right-hand key feeds a negative value and the left-hand key positive.
+    const steer = (input.keys.has('KeyA') ? 1 : 0) - (input.keys.has('KeyD') ? 1 : 0);
+    const brake = input.keys.has('Space');
+    car.drive(throttle, steer, brake, dt);
+    speed = car.speed;
+    heading = car.heading;
+    // The hidden figure rides along so its position always means "the player".
+    group.position.copy(car.group.position);
+    group.rotation.y = heading;
+  }
+
+  function tryEnterExit() {
+    // A mission start beats getting into a car.
+    const missions = ctx.missions;
+    if (missions && missions.startAvailable) {
+      missions.start();
+      return;
+    }
+    if (car) {
+      // Step out on the car's right-hand side, clear of walls.
+      const cp = car.group.position;
+      const rx = -Math.cos(car.heading);
+      const rz = Math.sin(car.heading);
+      group.position.set(cp.x + rx * EXIT_OFFSET, 0, cp.z + rz * EXIT_OFFSET);
+      resolveCollisions(group.position);
+      heading = car.heading;
+      group.rotation.y = heading;
+      car.driver = 'none';
+      car = null;
+      speed = 0;
+      group.visible = true;
+      return;
+    }
+    // Find the nearest car within reach.
+    let best = null;
+    let bestD = ENTER_RANGE;
+    const all = (ctx.vehicles && ctx.vehicles.all) || [];
+    for (let i = 0; i < all.length; i++) {
+      const v = all[i];
+      const d = dist2(group.position.x, group.position.z, v.group.position.x, v.group.position.z);
+      if (d < bestD) {
+        best = v;
+        bestD = d;
+      }
+    }
+    if (!best) return;
+    if (ctx.traffic) ctx.traffic.release(best);
+    best.driver = 'player';
+    car = best;
+    group.visible = false;
+  }
+
+  function update(dt) {
+    // First frame: take the start spot from the world module.
+    if (!placed) {
+      const start = ctx.world && ctx.world.places && ctx.world.places.playerStart;
+      if (start) {
+        group.position.set(start.x, 0, start.z);
+        heading = 0;
+        group.rotation.y = 0;
+      }
+      placed = true;
+    }
+    if (state.mode === 'playing') {
+      if (input.pressed.has('KeyE')) tryEnterExit();
+      if (car) updateDriving(dt);
+      else updateOnFoot(dt);
+      if (state.health <= 0) state.mode = 'wasted';
+    } else if (car) {
+      group.position.copy(car.group.position);
+      speed = 0;
     } else {
-      P.speed = 0;
-      const settle = Math.min(1, 10 * dt);
-      P.legL.rotation.x += (0 - P.legL.rotation.x) * settle;
-      P.legR.rotation.x += (0 - P.legR.rotation.x) * settle;
-    }
-    P.heading = P.angle;
-    P.mesh.position.set(P.x, bob, P.z);
-    P.mesh.rotation.y = -P.angle;
-  } else {
-    const car = P.vehicle;
-    const keys = input.keys;
-    const controls = {
-      throttle: (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0),
-      steer: (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0),
-      brake: keys.has('Space'),
-    };
-    driveVehicle(car, controls, dt, G.world);
-    P.x = car.x;
-    P.z = car.z;
-    P.angle = car.angle;
-    P.heading = car.angle;
-    P.speed = car.speed;
-    P.mesh.position.set(P.x, 0, P.z);
-    P.mesh.rotation.y = -P.angle;
-    if (audio) {
-      const fraction = clampNum(Math.abs(car.speed) / (car.type.top || 30), 0, 1);
-      audio.engine(fraction, true);
+      speed = damp(speed, 0, 8, dt);
     }
   }
 
-  P.camX = P.x;
-  P.camY = 2.2;
-  P.camZ = P.z;
+  function place(x, z, h) {
+    // An explicit placement counts as placed: the first update must not
+    // drag Rae back to the start spot (shot staging depends on this).
+    placed = true;
+    heading = h;
+    group.rotation.y = h;
+    if (car) {
+      car.place(x, z, h);
+      group.position.copy(car.group.position);
+    } else {
+      group.position.set(x, 0, z);
+      resolveCollisions(group.position);
+    }
+  }
+
+  function heal() {
+    state.health = 100;
+  }
+
+  return {
+    group,
+    get onFoot() {
+      return car === null;
+    },
+    get car() {
+      return car;
+    },
+    get speed() {
+      return speed;
+    },
+    get heading() {
+      return heading;
+    },
+    update,
+    place,
+    heal,
+  };
 }
