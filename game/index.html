@@ -3,101 +3,96 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dustline — Open-World Crime Game</title>
-<link rel="icon" href="data:,">
+<title>Dustline — Desert Highway City</title>
 <link rel="stylesheet" href="styles.css">
-<script type="importmap">
-{ "imports": { "three": "./vendor/three.module.min.js" } }
-</script>
 <script type="module" src="src/main.js"></script>
 </head>
 <body>
-<div id="app"></div>
+<div id="gameMount"></div>
 
-<!-- In-game HUD: hidden until a run starts. -->
-<div id="hud" class="hidden">
-  <div id="topleft">
-    <div id="district">Downtown</div>
-    <div id="objective">Free roam — find a mission marker</div>
+<div id="hud">
+  <div id="topLeft">
+    <div id="healthBar"><div id="healthFill"></div><span id="healthText">100</span></div>
+    <div id="stars"></div>
   </div>
-  <div id="topright">
-    <div id="wanted">☆☆☆☆☆</div>
-    <div id="money">$0</div>
+  <div id="topRight">
+    <div id="moneyText">$0</div>
+    <div id="relicText">Relics 0/10</div>
+    <button id="muteBtn" type="button">Music on</button>
   </div>
-  <div id="bottomleft">
-    <div id="health-bar"><div id="health-fill"></div></div>
-    <canvas id="minimap" width="180" height="180"></canvas>
-    <div id="relics">Relics 0/10</div>
+  <div id="objectiveText"></div>
+  <canvas id="minimap" width="180" height="180"></canvas>
+  <div id="bottomRight">
+    <div id="speedText">0 mph</div>
+    <div id="weaponText">Fists</div>
+    <div id="ammoText"></div>
   </div>
-  <div id="bottomright">
-    <div id="speed"></div>
-    <div id="weapon">Fists</div>
-    <div id="ammo"></div>
-  </div>
-  <div id="message"></div>
-  <div id="crosshair">+</div>
+  <div id="crosshair"><div class="ch-h"></div><div class="ch-v"></div></div>
+  <div id="banner"></div>
+  <div id="toast"></div>
 </div>
+<div id="damageFlash"></div>
 
-<!-- Title screen. -->
-<div id="menu-title" class="menu">
-  <h1>DUSTLINE</h1>
-  <p class="tag">A desert highway crime story</p>
-  <p class="intro">Rae Calloway drives packages across a sun-baked city where every job pays and every siren costs. Steal cars, outrun the law, run six jobs for the people of Dustline.</p>
-  <div class="buttons">
-    <button id="btn-start">Start driving</button>
-    <button id="btn-load">Continue save</button>
-    <button id="btn-help-title">How to play</button>
-  </div>
-  <p class="foot">An original game built for make.fun's Make GTA 6 bounty. Best in desktop Chrome. Sound on.</p>
-</div>
-
-<!-- Pause menu. -->
-<div id="menu-pause" class="menu hidden">
-  <h2>Paused</h2>
-  <div class="buttons">
-    <button id="btn-resume">Resume</button>
-    <button id="btn-save">Save game</button>
-    <button id="btn-help">How to play</button>
-    <button id="btn-restart">Restart</button>
-    <button id="btn-quit">Quit to title</button>
+<div id="menuTitle" class="menu">
+  <div class="menuCard">
+    <h1>DUSTLINE</h1>
+    <p class="tagline">A courier. A desert highway city. Six jobs, five stars, ten lost relics.</p>
+    <p class="blurb">Drive and walk the sun-baked streets of Dustline as Rae Calloway. Take jobs across the city, outrun the law, and find what the desert buried.</p>
+    <div class="controls">
+      <span><b>WASD</b> walk / drive</span>
+      <span><b>Mouse</b> aim, <b>click</b> shoot</span>
+      <span><b>E</b> enter car / start job</span>
+      <span><b>Shift</b> sprint</span>
+      <span><b>Space</b> brake</span>
+      <span><b>1 2 3</b> weapons</span>
+      <span><b>R</b> reload</span>
+      <span><b>Esc</b> pause</span>
+      <span><b>M</b> music</span>
+    </div>
+    <button id="btnStart" type="button">Start the run</button>
+    <button id="btnContinue" type="button">Continue</button>
+    <button id="btnHelp" type="button">How to play</button>
   </div>
 </div>
 
-<!-- Controls and tips. -->
-<div id="menu-help" class="menu hidden">
-  <h2>How to play</h2>
-  <div class="helpgrid">
-    <span>W A S D</span><span>Walk / drive</span>
-    <span>Mouse</span><span>Aim — click to shoot, wheel to swap weapon</span>
-    <span>E</span><span>Enter or exit a car · start a mission</span>
-    <span>Shift</span><span>Sprint on foot</span>
-    <span>Space</span><span>Brake while driving</span>
-    <span>1 2 3</span><span>Fists / pistol / SMG</span>
-    <span>R</span><span>Reload</span>
-    <span>Esc</span><span>Pause</span>
-    <span>M</span><span>Music on / off</span>
-  </div>
-  <p class="intro">Earn cash from missions and turquoise relics. Lose the heat at the Desert Rose paint shop (driving) or Rae's garage in Old Town (on foot). Stars mean the law is coming: foot cops, then cars, then the helicopter at five.</p>
-  <div class="buttons"><button id="btn-help-back">Back</button></div>
-</div>
-
-<!-- Death screen. -->
-<div id="menu-wasted" class="menu hidden">
-  <h2 class="bad">WASTED</h2>
-  <p class="intro">Rae went down in the dust. The clinic patches her up — for a fee.</p>
-  <div class="buttons">
-    <button id="btn-retry-wasted">Get back up (-$100)</button>
-    <button id="btn-load-wasted">Load save</button>
+<div id="menuPause" class="menu hidden">
+  <div class="menuCard">
+    <h1>Paused</h1>
+    <p class="blurb">The desert waits. WASD to move, E to enter a car or start a job, Esc to keep playing.</p>
+    <button id="btnResume" type="button">Keep playing</button>
+    <button id="btnRestart" type="button">Restart the run</button>
   </div>
 </div>
 
-<!-- Arrest screen. -->
-<div id="menu-busted" class="menu hidden">
-  <h2 class="bad">BUSTED</h2>
-  <p class="intro">The Dustline sheriff's department has Rae. Bail isn't cheap.</p>
-  <div class="buttons">
-    <button id="btn-retry-busted">Pay bail (-$150)</button>
-    <button id="btn-load-busted">Load save</button>
+<div id="menuHelp" class="menu hidden">
+  <div class="menuCard">
+    <h1>How to play</h1>
+    <div class="helpText">
+      <p><b>Move:</b> WASD walks and drives. Hold Shift to sprint on foot. Space brakes the car.</p>
+      <p><b>Cars:</b> press E near any car to take it. Press E again to get out.</p>
+      <p><b>Fight:</b> aim with the mouse, click to shoot, wheel or keys 1-2-3 to swap between fists, pistol and SMG. R reloads.</p>
+      <p><b>Jobs:</b> drive to a glowing marker and press E to start the job. Finish all six.</p>
+      <p><b>Heat:</b> the law comes in five levels. Lose them at the Desert Rose paint shop while driving, or lie low at Rae's garage on foot.</p>
+      <p><b>Relics:</b> ten turquoise relics hide around the city. Each one pays.</p>
+      <p><b>Save:</b> progress saves automatically. M toggles the music.</p>
+    </div>
+    <button id="btnHelpBack" type="button">Back</button>
+  </div>
+</div>
+
+<div id="menuWasted" class="menu hidden">
+  <div class="menuCard">
+    <h1>Wasted</h1>
+    <p class="blurb">Rae went down in the dust. The city keeps moving.</p>
+    <button id="btnRestartWasted" type="button">Run it back</button>
+  </div>
+</div>
+
+<div id="menuBusted" class="menu hidden">
+  <div class="menuCard">
+    <h1>Busted</h1>
+    <p class="blurb">The Dustline sheriff's department caught up with Rae.</p>
+    <button id="btnRestartBusted" type="button">Run it back</button>
   </div>
 </div>
 </body>

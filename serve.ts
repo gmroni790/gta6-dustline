@@ -1,72 +1,60 @@
-// A tiny static server for game/ (Node 22, standard library only), so an entry can be played
-// locally without a build step: `node serve.ts` serves game/ on http://localhost:8080.
-// It sends the MIME types a browser game needs, refuses any path outside game/, and otherwise
-// does nothing clever: this is a development convenience, not a web server for the internet.
-import { createReadStream, statSync } from 'node:fs';
+// Dustline local server (Node 22, standard library only): serves the game/
+// folder on http://localhost:8080 so the game can be played with no build
+// step. Run it with `node serve.ts`; pass --port N to pick another port.
+// A development convenience only — it serves local files, nothing more.
 import { createServer } from 'node:http';
-import { extname, join, normalize, resolve, sep } from 'node:path';
+import { readFileSync, statSync } from 'node:fs';
+import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
-const args = process.argv.slice(2);
-const portIndex = args.indexOf('--port');
-const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
-const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
+const gameRoot = resolve(fileURLToPath(new URL('./game', import.meta.url)));
 
-const MIME: Record<string, string> = {
+const args = process.argv.slice(2);
+const flagAt = args.indexOf('--port');
+const wanted = flagAt === -1 ? 8080 : Number(args[flagAt + 1]);
+const port = Number.isInteger(wanted) && wanted > 0 && wanted < 65536 ? wanted : 8080;
+
+const types = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.glb': 'model/gltf-binary',
-  '.gltf': 'model/gltf+json',
-  '.bin': 'application/octet-stream',
-  '.wasm': 'application/wasm',
-  '.wav': 'audio/wav',
-  '.mp3': 'audio/mpeg',
-  '.ogg': 'audio/ogg',
-  '.txt': 'text/plain; charset=utf-8',
+  '.png': 'image/png',
 };
 
-createServer((request, response) => {
-  const url = new URL(request.url ?? '/', 'http://localhost');
-  let pathname: string;
+const server = createServer((req, res) => {
+  let name;
   try {
-    pathname = decodeURIComponent(url.pathname);
+    name = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname);
   } catch {
-    response.writeHead(400).end('bad request');
+    res.writeHead(400).end('bad path');
     return;
   }
-  if (pathname.endsWith('/')) pathname += 'index.html';
-  const file = resolve(join(root, normalize(pathname)));
-  if (file !== root && !file.startsWith(root + sep)) {
-    response.writeHead(403).end('forbidden');
+  if (name.endsWith('/')) name += 'index.html';
+  const file = resolve(join(gameRoot, name));
+  if (file !== gameRoot && !file.startsWith(gameRoot + sep)) {
+    res.writeHead(403).end('forbidden');
     return;
   }
-  let size: number;
+  let body;
   try {
-    const stats = statSync(file);
-    if (!stats.isFile()) throw new Error('not a file');
-    size = stats.size;
+    if (!statSync(file).isFile()) throw new Error('not a file');
+    body = readFileSync(file);
   } catch {
-    response.writeHead(404).end('not found');
+    res.writeHead(404).end('not found');
     return;
   }
-  response.writeHead(200, {
-    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'content-length': size,
+  res.writeHead(200, {
+    'content-type': types[extname(file).toLowerCase()] ?? 'application/octet-stream',
+    'content-length': body.length,
     'cache-control': 'no-store',
   });
-  createReadStream(file).pipe(response);
-}).listen(port, '127.0.0.1', () => {
-  console.log(`game/ is on http://localhost:${port}`);
+  res.end(body);
+});
+
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Dustline is on http://localhost:${port}`);
 });

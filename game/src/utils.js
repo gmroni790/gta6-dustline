@@ -1,68 +1,77 @@
-// Small math helpers shared across the Dustline modules.
-// Nothing here touches the DOM or the game state — pure functions only.
+// Dustline shared helpers: a seeded random generator plus the small math
+// functions every game module uses. Pure code only — no scene, no DOM, no
+// network — so any module can import it without side effects.
 
-/**
- * mulberry32: a tiny seeded PRNG. Given the same seed it always
- * produces the same stream of numbers in [0, 1).
- */
-export function mulberry32(seed) {
-  let state = seed >>> 0;
-  return function next() {
-    state = (state + 0x6D2B79F5) | 0;
-    let mix = Math.imul(state ^ (state >>> 15), 1 | state);
-    mix = (mix + Math.imul(mix ^ (mix >>> 7), 61 | mix)) ^ mix;
-    return ((mix ^ (mix >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Random float in [a, b) from PRNG r. */
-export function rrange(r, a, b) {
-  return a + r() * (b - a);
-}
-
-/** Random integer in [a, b] (inclusive) from PRNG r. */
-export function rint(r, a, b) {
-  return Math.floor(a + r() * (b - a + 1));
-}
-
-/** Random element of arr from PRNG r. */
-export function rpick(r, arr) {
-  return arr[Math.floor(r() * arr.length)];
+/** A deterministic random stream from one integer seed. Same seed, same numbers. */
+export class Rng {
+  constructor(seed) {
+    let s = (seed >>> 0) || 1;
+    this.next = () => {
+      s = (s + 0x6d2b79f5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  /** A float in [0, 1). */
+  value() {
+    return this.next();
+  }
+  /** A float between a (inclusive) and b (exclusive). */
+  range(a, b) {
+    return a + this.next() * (b - a);
+  }
+  /** A whole number between a (inclusive) and b (exclusive). */
+  int(a, b) {
+    return Math.floor(this.range(a, b));
+  }
+  /** One element picked from a non-empty array. */
+  pick(list) {
+    return list[Math.floor(this.next() * list.length)];
+  }
+  /** True with probability p (0 to 1). */
+  chance(p) {
+    return this.next() < p;
+  }
 }
 
 /** Clamp v into [a, b]. */
 export function clamp(v, a, b) {
-  if (v < a) return a;
-  if (v > b) return b;
-  return v;
+  return v < a ? a : v > b ? b : v;
 }
 
-/** Linear interpolation between a and b at t. */
+/** Linear blend between a and b. */
 export function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-/** Wrap an angle into [-PI, PI]. */
+/** Frame-rate independent approach: moves a toward b, faster when lambda is larger. */
+export function damp(a, b, lambda, dt) {
+  return lerp(a, b, 1 - Math.exp(-lambda * dt));
+}
+
+/** Wrap an angle into (-PI, PI]. */
 export function wrapAngle(a) {
-  const tau = Math.PI * 2;
-  while (a > Math.PI) a -= tau;
-  while (a < -Math.PI) a += tau;
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a <= -Math.PI) a += Math.PI * 2;
   return a;
 }
 
-/**
- * Move cur toward target by at most maxStep radians, taking the
- * shortest way around the circle. Snaps to target when within reach.
- */
-export function turnToward(cur, target, maxStep) {
-  const diff = wrapAngle(target - cur);
-  if (Math.abs(diff) <= maxStep) return target;
-  return cur + Math.sign(diff) * maxStep;
+/** Shortest-arc blend between two headings. */
+export function angleLerp(a, b, t) {
+  return a + wrapAngle(b - a) * t;
 }
 
-/** Squared distance on the ground plane (skips the sqrt). */
+/** Distance on the ground plane between two (x, z) points. */
 export function dist2(ax, az, bx, bz) {
-  const dx = ax - bx;
-  const dz = az - bz;
+  const dx = bx - ax;
+  const dz = bz - az;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
+/** Square of the ground-plane distance (cheaper when only comparing). */
+export function dist2Sq(ax, az, bx, bz) {
+  const dx = bx - ax;
+  const dz = bz - az;
   return dx * dx + dz * dz;
 }
