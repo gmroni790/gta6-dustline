@@ -6,7 +6,7 @@
 // Local stand-in for the grader's /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -26,17 +26,41 @@ function handIn() {
   const repoRoot = dirname(fileURLToPath(import.meta.url));
   const destination = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
+  // Fail loudly before copying anything, rather than handing in an entry
+  // the scorer would refuse: the game folder must exist, and the shots
+  // must be within the count and per-file byte caps.
+  const gameDir = join(repoRoot, 'game');
+  if (!existsSync(gameDir)) throw new Error(`no game/ folder in ${repoRoot}`);
+  const shotsIn = join(repoRoot, 'screenshots');
+  if (existsSync(shotsIn)) {
+    const shots = readdirSync(shotsIn).filter((name) => name.endsWith('.jpg'));
+    if (shots.length > DOSSIER_CAPS.screenshots.max) {
+      throw new Error(`${shots.length} screenshots, cap is ${DOSSIER_CAPS.screenshots.max}`);
+    }
+    for (const name of shots) {
+      const bytes = statSync(join(shotsIn, name)).size;
+      if (bytes > DOSSIER_CAPS.screenshots.max_bytes) {
+        throw new Error(`${name} is ${bytes} bytes, cap is ${DOSSIER_CAPS.screenshots.max_bytes}`);
+      }
+    }
+  }
+
   mkdirSync(destination, { recursive: true });
-  cpSync(join(repoRoot, 'game'), join(destination, 'game'), { recursive: true });
+  cpSync(gameDir, join(destination, 'game'), { recursive: true });
 
   const shotsOut = join(destination, 'screenshots');
   mkdirSync(shotsOut, { recursive: true });
-  const shotsIn = join(repoRoot, 'screenshots');
   if (existsSync(shotsIn)) cpSync(shotsIn, shotsOut, { recursive: true });
 
   const dossier = buildDossier(destination, DOSSIER_CAPS);
   writeFileSync(join(destination, 'dossier.json'), dossier);
-  console.log(`Dustline handed in: ${destination} (dossier ${dossier.length} bytes)`);
+  // buildDossier hands back raw bytes, so decode before inspecting them.
+  const textBytes = JSON.parse(Buffer.from(dossier).toString('utf8')).text.length;
+  const textNote =
+    textBytes >= DOSSIER_CAPS.text_max_bytes
+      ? ` — WARNING: dossier text hit the ${DOSSIER_CAPS.text_max_bytes}-byte cap`
+      : ` (text ${textBytes}/${DOSSIER_CAPS.text_max_bytes} bytes)`;
+  console.log(`Dustline handed in: ${destination} (dossier ${dossier.length} bytes)${textNote}`);
 }
 
 handIn();
