@@ -1,35 +1,69 @@
-const $ = id => document.getElementById(id);
+// HUD, menus and minimap for Dustline.
+//
+// The HUD reads the game object every frame and mirrors it into the DOM:
+// wanted stars, money, health, speed, weapon, objective, district and
+// relic count, plus a circular minimap drawn on a 180x180 canvas. Menus
+// are plain DOM overlays; button clicks are forwarded to H.onAction so
+// main.js decides what each action does.
+
+const $ = (id) => document.getElementById(id);
 
 export function createHUD() {
   const el = {
-    hud: $('hud'), wanted: $('wanted'), money: $('money'),
-    health: $('health-fill'), speed: $('speed'), weapon: $('weapon'),
-    ammo: $('ammo'), objective: $('objective'), message: $('message'),
-    map: $('minimap'), cross: $('crosshair'), district: $('district'),
-    relics: $('relics')
+    hud: $('hud'),
+    wanted: $('wanted'),
+    money: $('money'),
+    healthFill: $('health-fill'),
+    speed: $('speed'),
+    weapon: $('weapon'),
+    ammo: $('ammo'),
+    objective: $('objective'),
+    message: $('message'),
+    map: $('minimap'),
+    crosshair: $('crosshair'),
+    district: $('district'),
+    relics: $('relics'),
   };
+
   const menus = {
-    title: $('menu-title'), pause: $('menu-pause'), help: $('menu-help'),
-    wasted: $('menu-wasted'), busted: $('menu-busted')
+    title: $('menu-title'),
+    pause: $('menu-pause'),
+    help: $('menu-help'),
+    wasted: $('menu-wasted'),
+    busted: $('menu-busted'),
   };
-  const mctx = el.map ? el.map.getContext('2d') : null;
-  let flashUntil = 0, lastDistrict = 0, districtName = '';
+
+  const mapCtx = el.map ? el.map.getContext('2d') : null;
+
+  let flashUntil = 0;      // performance.now() deadline for the message
+  let districtAt = 0;      // last time the district name was recomputed
+  let districtName = '';   // cached nearest district
 
   const H = {
+    // Set by main.js: called with 'start', 'load', 'resume', ... on click.
     onAction: null,
 
+    // Show one menu and hide the rest. Title/wasted/busted hide the HUD.
     showMenu(name) {
-      for (const k in menus) if (menus[k]) menus[k].classList.add('hidden');
+      for (const key in menus) {
+        if (menus[key]) menus[key].classList.add('hidden');
+      }
       if (menus[name]) menus[name].classList.remove('hidden');
-      if (el.hud) el.hud.classList.toggle('hidden',
-        name === 'title' || name === 'wasted' || name === 'busted');
+      if (el.hud) {
+        el.hud.classList.toggle('hidden',
+          name === 'title' || name === 'wasted' || name === 'busted');
+      }
     },
 
+    // Hide every menu and bring the HUD back.
     hideAllMenus() {
-      for (const k in menus) if (menus[k]) menus[k].classList.add('hidden');
+      for (const key in menus) {
+        if (menus[key]) menus[key].classList.add('hidden');
+      }
       if (el.hud) el.hud.classList.remove('hidden');
     },
 
+    // Flash a message in the centre of the screen for `ms` milliseconds.
     flash(msg, ms = 2500) {
       if (!el.message) return;
       el.message.textContent = msg;
@@ -39,148 +73,227 @@ export function createHUD() {
     },
 
     update(G) {
-      const P = G.player, C = G.combat, M = G.missions, W = G.world, PO = G.police;
+      const player = G.player;
+      const combat = G.combat;
+      const missions = G.missions;
+      const world = G.world;
+      const police = G.police;
       const now = performance.now();
+
+      // Hide the flash message once its time is up.
       if (el.message && flashUntil && now > flashUntil) {
         el.message.style.display = 'none';
         flashUntil = 0;
       }
-      const wanted = PO ? PO.wanted || 0 : 0;
+
+      // Wanted stars: filled for the current level, dim when clean.
+      const wanted = police ? police.wanted || 0 : 0;
       if (el.wanted) {
         el.wanted.textContent = '★'.repeat(wanted) + '☆'.repeat(5 - wanted);
         el.wanted.style.opacity = wanted > 0 ? '1' : '0.45';
       }
+
       if (el.money) el.money.textContent = '$' + G.money;
-      if (el.health) {
-        const h = Math.max(0, Math.min(100, P.health));
-        el.health.style.width = h + '%';
-        el.health.style.background = h > 50 ? '#4caf50' : h > 25 ? '#ffb020' : '#e33';
+
+      // Health bar: width follows health, colour green > amber > red.
+      if (el.healthFill) {
+        const hp = Math.max(0, Math.min(100, player.health));
+        el.healthFill.style.width = hp + '%';
+        el.healthFill.style.background = hp > 50 ? '#4caf50' : hp > 25 ? '#ffb020' : '#e33';
       }
-      const V = P.vehicle || null;
-      if (el.speed) el.speed.textContent = V ? Math.round(V.speed * 2.237) + ' mph' : '';
-      const w = C ? C.weapon : 'fists';
-      const armed = w === 'pistol' || w === 'smg';
-      const wname = armed ? (w === 'pistol' ? 'Pistol' : 'SMG') : 'Fists';
-      const ammoTxt = armed ? (C.mag[w] ?? 0) + '/' + (C.ammo[w] ?? 0) : '';
-      if (el.weapon) el.weapon.textContent = armed ? wname + ' ' + ammoTxt : wname;
-      if (el.ammo) el.ammo.textContent = ammoTxt;
+
+      const vehicle = player.vehicle || null;
+
+      // Speed, only while driving (world units/s -> mph).
+      if (el.speed) {
+        el.speed.textContent = vehicle ? Math.round(vehicle.speed * 2.237) + ' mph' : '';
+      }
+
+      // Weapon line: name plus mag/reserve for guns, 'Fists' otherwise.
+      const weapon = combat ? combat.weapon : 'fists';
+      const armed = weapon === 'pistol' || weapon === 'smg';
+      const weaponName = armed ? (weapon === 'pistol' ? 'Pistol' : 'SMG') : 'Fists';
+      const ammoText = armed ? (combat.mag[weapon] ?? 0) + '/' + (combat.ammo[weapon] ?? 0) : '';
+      if (el.weapon) el.weapon.textContent = armed ? weaponName + ' ' + ammoText : weaponName;
+      if (el.ammo) el.ammo.textContent = ammoText;
+
       if (el.objective) el.objective.textContent = G.objective || '';
-      if (el.district && W && W.districts && now - lastDistrict > 500) {
-        lastDistrict = now;
-        let best = null, bd = Infinity;
-        for (const d of W.districts) {
-          const dx = (d.x ?? d.cx ?? 0) - P.x, dz = (d.z ?? d.cz ?? 0) - P.z;
+
+      // District: nearest named district, recomputed at most twice a second.
+      if (el.district && world && world.districts && now - districtAt > 500) {
+        districtAt = now;
+        let best = null;
+        let bestDist = Infinity;
+        for (const d of world.districts) {
+          const dx = (d.x ?? d.cx ?? 0) - player.x;
+          const dz = (d.z ?? d.cz ?? 0) - player.z;
           const q = dx * dx + dz * dz;
-          if (q < bd) { bd = q; best = d; }
+          if (q < bestDist) {
+            bestDist = q;
+            best = d;
+          }
         }
         districtName = best ? best.name : '';
         el.district.textContent = districtName;
       }
-      if (el.relics && M && M.relics) {
-        const f = M.relics.found;
-        el.relics.textContent = 'Relics ' + (f.size ?? f.length ?? 0) + '/10';
+
+      if (el.relics && missions && missions.relics) {
+        const found = missions.relics.found;
+        el.relics.textContent = 'Relics ' + (found.size ?? found.length ?? 0) + '/10';
       }
-      if (el.cross) {
-        const show = !V && G.state === 'playing' &&
-          (wname === 'Pistol' || wname === 'SMG' || wname === 'pistol' || wname === 'smg');
-        el.cross.style.display = show ? '' : 'none';
+
+      // Crosshair: only on foot, playing, holding a gun.
+      if (el.crosshair) {
+        const show = !vehicle && G.state === 'playing' && armed;
+        el.crosshair.style.display = show ? '' : 'none';
       }
-      drawMap(G, V);
-    }
+
+      drawMinimap(G, vehicle);
+    },
   };
 
-  function drawMap(G, V) {
-    if (!mctx) return;
-    const S = 180, C0 = S / 2, m = 6, sc = (S - m * 2) / 460;
-    const px = x => C0 + x * sc, py = z => C0 + z * sc;
-    const ctx = mctx, P = G.player, W = G.world, M = G.missions, PO = G.police;
+  // Circular minimap: roads, districts, unfound relics, active target,
+  // police units and the player arrow. The map covers ±230 world units
+  // across the 180px canvas with a 6px margin.
+  function drawMinimap(G, vehicle) {
+    if (!mapCtx) return;
+    const SIZE = 180;
+    const HALF = SIZE / 2;
+    const MARGIN = 6;
+    const scale = (SIZE - MARGIN * 2) / 460;
+    const toX = (x) => HALF + x * scale;
+    const toY = (z) => HALF + z * scale;
+
+    const ctx = mapCtx;
+    const player = G.player;
+    const world = G.world;
+    const missions = G.missions;
+    const police = G.police;
+
     ctx.save();
-    ctx.clearRect(0, 0, S, S);
-    ctx.beginPath(); ctx.arc(C0, C0, C0 - 1, 0, Math.PI * 2); ctx.clip();
-    ctx.fillStyle = '#241d12'; ctx.fillRect(0, 0, S, S);
-    if (W && W.roads) {
-      ctx.strokeStyle = '#8a7a5a'; ctx.lineWidth = 2;
-      for (const r of W.roads) {
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    ctx.beginPath();
+    ctx.arc(HALF, HALF, HALF - 1, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = '#241d12';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+
+    // Roads: support the {x1,z1,x2,z2} form plus a few alternates.
+    if (world && world.roads) {
+      ctx.strokeStyle = '#8a7a5a';
+      ctx.lineWidth = 2;
+      for (const road of world.roads) {
         ctx.beginPath();
-        if (Array.isArray(r)) {
-          r.forEach((pt, i) => i ? ctx.lineTo(px(pt[0]), py(pt[1])) : ctx.moveTo(px(pt[0]), py(pt[1])));
-        } else if (r.x1 !== undefined) {
-          ctx.moveTo(px(r.x1), py(r.z1)); ctx.lineTo(px(r.x2), py(r.z2));
-        } else if (r.a && r.b) {
-          ctx.moveTo(px(r.a.x), py(r.a.z)); ctx.lineTo(px(r.b.x), py(r.b.z));
-        } else if (r.x !== undefined && r.z !== undefined && r.x2 !== undefined) {
-          ctx.moveTo(px(r.x), py(r.z)); ctx.lineTo(px(r.x2), py(r.z2));
+        if (Array.isArray(road)) {
+          road.forEach((pt, i) => {
+            if (i) ctx.lineTo(toX(pt[0]), toY(pt[1]));
+            else ctx.moveTo(toX(pt[0]), toY(pt[1]));
+          });
+        } else if (road.x1 !== undefined) {
+          ctx.moveTo(toX(road.x1), toY(road.z1));
+          ctx.lineTo(toX(road.x2), toY(road.z2));
+        } else if (road.a && road.b) {
+          ctx.moveTo(toX(road.a.x), toY(road.a.z));
+          ctx.lineTo(toX(road.b.x), toY(road.b.z));
+        } else if (road.x !== undefined && road.z !== undefined && road.x2 !== undefined) {
+          ctx.moveTo(toX(road.x), toY(road.z));
+          ctx.lineTo(toX(road.x2), toY(road.z2));
         }
         ctx.stroke();
       }
     }
-    if (W && W.districts) {
+
+    // District dots.
+    if (world && world.districts) {
       ctx.fillStyle = '#6b5d43';
-      for (const d of W.districts) {
+      for (const d of world.districts) {
         ctx.beginPath();
-        ctx.arc(px(d.x ?? d.cx ?? 0), py(d.z ?? d.cz ?? 0), 2, 0, Math.PI * 2);
+        ctx.arc(toX(d.x ?? d.cx ?? 0), toY(d.z ?? d.cz ?? 0), 2, 0, Math.PI * 2);
         ctx.fill();
       }
     }
-    const relics = (M && M.relics && (M.relics.list || M.relics.items || M.relics.all)) || (W && (W.relics || W.relicSpots)) || [];
-    const found = (M && M.relics && M.relics.found) || new Set();
+
+    // Unfound relics as cyan dots.
+    const relicSpots = (missions && missions.relics && (missions.relics.list || missions.relics.items || missions.relics.all))
+      || (world && (world.relics || world.relicSpots))
+      || [];
+    const found = (missions && missions.relics && missions.relics.found) || new Set();
     ctx.fillStyle = '#22d3ee';
-    relics.forEach((r, i) => {
+    relicSpots.forEach((spot, i) => {
       if (found.has ? found.has(i) : found.includes(i)) return;
       ctx.beginPath();
-      ctx.arc(px(r.x ?? 0), py(r.z ?? 0), 2.5, 0, Math.PI * 2);
+      ctx.arc(toX(spot.x ?? 0), toY(spot.z ?? 0), 2.5, 0, Math.PI * 2);
       ctx.fill();
     });
-    const t = M ? M.activeTarget : null;
-    if (t && Math.floor(performance.now() / 400) % 2 === 0) {
-      const tx = px(t.x ?? 0), ty = py(t.z ?? 0);
+
+    // Active mission target: a blinking yellow diamond.
+    const target = missions ? missions.activeTarget : null;
+    if (target && Math.floor(performance.now() / 400) % 2 === 0) {
+      const tx = toX(target.x ?? 0);
+      const ty = toY(target.z ?? 0);
       ctx.fillStyle = '#ffd21f';
       ctx.beginPath();
-      ctx.moveTo(tx, ty - 5); ctx.lineTo(tx + 4, ty);
-      ctx.lineTo(tx, ty + 5); ctx.lineTo(tx - 4, ty);
-      ctx.closePath(); ctx.fill();
-    }
-    ctx.fillStyle = '#3b82f6';
-    const dots = [];
-    if (PO) {
-      if (PO.cars) dots.push(...PO.cars);
-      if (PO.cops) dots.push(...PO.cops);
-      if (PO.units) dots.push(...PO.units);
-    }
-    for (const u of dots) {
-      ctx.beginPath();
-      ctx.arc(px(u.x ?? 0), py(u.z ?? 0), 2.5, 0, Math.PI * 2);
+      ctx.moveTo(tx, ty - 5);
+      ctx.lineTo(tx + 4, ty);
+      ctx.lineTo(tx, ty + 5);
+      ctx.lineTo(tx - 4, ty);
+      ctx.closePath();
       ctx.fill();
     }
-    const a = V ? V.angle : P.angle;
-    const hx = px(P.x), hy = py(P.z);
+
+    // Police units as blue dots.
+    ctx.fillStyle = '#3b82f6';
+    const units = [];
+    if (police) {
+      if (police.cars) units.push(...police.cars);
+      if (police.cops) units.push(...police.cops);
+      if (police.units) units.push(...police.units);
+    }
+    for (const unit of units) {
+      ctx.beginPath();
+      ctx.arc(toX(unit.x ?? 0), toY(unit.z ?? 0), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Player arrow, rotated by heading.
+    const heading = vehicle ? vehicle.angle : player.angle;
     ctx.save();
-    ctx.translate(hx, hy); ctx.rotate(a + Math.PI / 2);
+    ctx.translate(toX(player.x), toY(player.z));
+    ctx.rotate(heading + Math.PI / 2);
     ctx.fillStyle = '#fff';
     ctx.beginPath();
-    ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(-4, 5);
-    ctx.closePath(); ctx.fill();
+    ctx.moveTo(0, -6);
+    ctx.lineTo(4, 5);
+    ctx.lineTo(-4, 5);
+    ctx.closePath();
+    ctx.fill();
     ctx.restore();
+
     ctx.restore();
   }
 
-  const wire = (id, action) => {
-    const b = $(id);
-    if (b) b.addEventListener('click', () => { if (H.onAction) H.onAction(action); });
-  };
-  wire('btn-start', 'start');
-  wire('btn-load', 'load');
-  wire('btn-load-wasted', 'load');
-  wire('btn-load-busted', 'load');
-  wire('btn-resume', 'resume');
-  wire('btn-save', 'save');
-  wire('btn-restart', 'restart');
-  wire('btn-help', 'help');
-  wire('btn-help-title', 'help');
-  wire('btn-help-back', 'help-back');
-  wire('btn-quit', 'quit');
-  wire('btn-retry-wasted', 'retry');
-  wire('btn-retry-busted', 'retry');
+  // Wire every menu button to the onAction callback with its action name.
+  function wireButton(id, action) {
+    const button = $(id);
+    if (button) {
+      button.addEventListener('click', () => {
+        if (H.onAction) H.onAction(action);
+      });
+    }
+  }
+  wireButton('btn-start', 'start');
+  wireButton('btn-load', 'load');
+  wireButton('btn-load-wasted', 'load');
+  wireButton('btn-load-busted', 'load');
+  wireButton('btn-resume', 'resume');
+  wireButton('btn-save', 'save');
+  wireButton('btn-restart', 'restart');
+  wireButton('btn-help', 'help');
+  wireButton('btn-help-title', 'help');
+  wireButton('btn-help-back', 'help-back');
+  wireButton('btn-quit', 'quit');
+  wireButton('btn-retry-wasted', 'retry');
+  wireButton('btn-retry-busted', 'retry');
 
   return H;
 }
